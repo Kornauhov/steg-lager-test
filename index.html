@@ -128,7 +128,11 @@
       if (!user) return;
 
       // ✅ NO where(appId==...) here (to avoid "empty" due to filter/index)
-      const itemsQ = query(collectionGroup(db, "items"));
+      const itemsQ = query(
+  collectionGroup(db, "items"),
+  where("appId", "==", APP_ID)
+);
+
       const unsubItems = onSnapshot(
         itemsQ,
         (snap) => {
