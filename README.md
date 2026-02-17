@@ -1,2 +1,0 @@
-# steg-lager-test
-test
