@@ -29,23 +29,36 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
   import {
-    getFirestore, collection, collectionGroup, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc, query
+    getFirestore,
+    collection, collectionGroup,
+    doc, setDoc, addDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc,
+    query, where, orderBy, limit,
+    runTransaction, serverTimestamp
   } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
   import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
 
   window.FirebaseSDK = {
-    initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc, query,
+    initializeApp,
+    getFirestore,
+    collection, collectionGroup,
+    doc, setDoc, addDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc,
+    query, where, orderBy, limit,
+    runTransaction, serverTimestamp,
     getAuth, signInAnonymously, onAuthStateChanged
   };
 </script>
 
 <script type="text/babel">
-  const { useState, useEffect, useMemo } = React;
+  const { useState, useEffect, useMemo, useCallback } = React;
   const {
-    initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc, query,
+    initializeApp, getFirestore,
+    collection, collectionGroup,
+    doc, setDoc, addDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc,
+    query, where, orderBy, limit,
+    runTransaction, serverTimestamp,
     getAuth, signInAnonymously, onAuthStateChanged
   } = window.FirebaseSDK;
 
@@ -70,18 +83,25 @@
     <i data-lucide={name} style={{ width: size, height: size }} className={className}></i>
   );
 
-  const safeDocId = (s) => String(s || "").replace(/\//g, "_").trim();
+  // robustere Doc-ID
+  const safeDocId = (s) => {
+    const x = String(s ?? "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .replace(/\//g, "_")
+      .replace(/[#?%\\]/g, "_");
+    return x || "EMPTY";
+  };
+
   const slotIdFrom = (shelf, level) => `${String(shelf)}_L${Number(level)}`;
 
-  // ✅ derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
+  // derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
   const deriveFromPath = (path) => {
-    // Example: "artifacts/stege-lager-v1/public/data/slots/C1_L1/items/STEG_A"
     const parts = String(path).split("/");
     const idx = parts.indexOf("slots");
     if (idx === -1) return { slotId: null, shelf: null, level: null };
     const slotId = parts[idx + 1] || null;
     if (!slotId) return { slotId: null, shelf: null, level: null };
-
     const m = String(slotId).match(/^(.+)_L(\d+)$/);
     if (!m) return { slotId, shelf: null, level: null };
     return { slotId, shelf: m[1], level: Number(m[2]) };
@@ -92,17 +112,23 @@
     const [loading, setLoading] = useState(true);
     const [user, setUser] = useState(null);
 
-    // raw docs from firestore (no filter)
     const [rawItems, setRawItems] = useState([]);
     const [stegItems, setStegItems] = useState([]);
     const [masterItems, setMasterItems] = useState([]);
 
     const [searchQuery, setSearchQuery] = useState("");
 
-    // forms
     const [newStock, setNewStock] = useState({ itemKey: "", shelf: "C1", level: 1, qty: "", source: "anlieferung" });
     const [outStock, setOutStock] = useState({ entryId: "", qty: "", destination: "produktion" });
     const [moveStock, setMoveStock] = useState({ entryId: "", targetShelf: "C1", targetLevel: 1, qty: "" });
+
+    // tiny toast
+    const [toast, setToast] = useState(null);
+    const pushToast = useCallback((type, msg) => {
+      setToast({ type, msg, id: Math.random().toString(36).slice(2) });
+      window.clearTimeout(pushToast.__t);
+      pushToast.__t = window.setTimeout(() => setToast(null), 2600);
+    }, []);
 
     const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
     const levels = [5, 4, 3, 2, 1];
@@ -122,26 +148,40 @@
 
     useEffect(() => {
       if (window.lucide) window.lucide.createIcons();
-    }, [activeTab, rawItems.length, stegItems.length]);
+    }, [activeTab, rawItems.length, stegItems.length, toast?.id]);
 
     useEffect(() => {
       if (!user) return;
 
-      // ✅ NO where(appId==...) here (to avoid "empty" due to filter/index)
-      const itemsQ = query(collectionGroup(db, "items"));
-      const unsubItems = onSnapshot(
-        itemsQ,
-        (snap) => {
-          const docs = snap.docs.map(d => ({
-            __path: d.ref.path,
-            __id: d.id,
-            ...d.data()
-          }));
-          console.log("RAW items snap:", snap.size, docs.slice(0,3));
-          setRawItems(docs);
-        },
-        (err) => console.error("Items fetch error:", err)
-      );
+      // ✅ Versuch: scoped collectionGroup by appId (schneller/sauberer)
+      //    Fallback: unfiltered, falls Index/Query-Probleme.
+      let unsubItems = null;
+
+      const startItemsListener = () => {
+        const scopedQ = query(collectionGroup(db, "items"), where("appId", "==", APP_ID));
+        unsubItems = onSnapshot(
+          scopedQ,
+          (snap) => {
+            const docs = snap.docs.map(d => ({ __path: d.ref.path, __id: d.id, ...d.data() }));
+            setRawItems(docs);
+          },
+          (err) => {
+            console.warn("Scoped items query failed, falling back to unfiltered collectionGroup(items):", err);
+            const fallbackQ = query(collectionGroup(db, "items"));
+            if (unsubItems) unsubItems();
+            unsubItems = onSnapshot(
+              fallbackQ,
+              (snap) => {
+                const docs = snap.docs.map(d => ({ __path: d.ref.path, __id: d.id, ...d.data() }));
+                setRawItems(docs);
+              },
+              (err2) => console.error("Fallback items fetch error:", err2)
+            );
+          }
+        );
+      };
+
+      startItemsListener();
 
       const unsubSteg = onSnapshot(
         collection(db, "artifacts", APP_ID, "public", "data", "steg_items"),
@@ -161,10 +201,14 @@
         (err) => console.error("Master items fetch error:", err)
       );
 
-      return () => { unsubItems(); unsubSteg(); unsubMaster(); };
+      return () => {
+        if (unsubItems) unsubItems();
+        unsubSteg();
+        unsubMaster();
+      };
     }, [user]);
 
-    // ✅ Filter client-side by appId OR by path containing "/artifacts/stege-lager-v1/"
+    // Filter client-side by appId OR by path containing "/artifacts/stege-lager-v1/"
     const itemDocs = useMemo(() => {
       const out = [];
 
@@ -172,8 +216,6 @@
         const path = d.__path || "";
         const pathHasApp = path.includes(`artifacts/${APP_ID}/`);
         const fieldHasApp = String(d.appId || "") === APP_ID;
-
-        // accept if either matches (robust during migration)
         if (!pathHasApp && !fieldHasApp) continue;
 
         const derived = deriveFromPath(path);
@@ -204,7 +246,6 @@
       return out;
     }, [rawItems]);
 
-    // ✅ slotMap for dashboard/inventory
     const slotMap = useMemo(() => {
       const m = new Map();
       for (const it of itemDocs) {
@@ -243,7 +284,6 @@
       return s ? Array.from(s) : [];
     };
 
-    // grouped slots
     const groupedSlots = useMemo(() => {
       const rows = Array.from(slotMap.entries()).map(([key, entries]) => {
         const [shelf, levelStr] = key.split("|");
@@ -274,47 +314,10 @@
       }).filter(Boolean);
     }, [groupedSlots, searchQuery, awbIndex]);
 
-    // Firestore refs for writes (new model)
+    // Firestore refs
     const slotDocRef = (slotId) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId);
     const itemDocRef = (slotId, itemKey) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items", safeDocId(itemKey));
-
-    const handleAddStock = async (e) => {
-      e.preventDefault();
-      const qty = Number(newStock.qty);
-      const itemKey = newStock.itemKey;
-      const shelf = newStock.shelf;
-      const level = Number(newStock.level);
-      if (!itemKey || !shelf || !level || !qty || qty <= 0) return;
-
-      const slotId = `${shelf}_L${level}`;
-      const sRef = slotDocRef(slotId);
-      const iRef = itemDocRef(slotId, itemKey);
-
-      try {
-        await setDoc(sRef, { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() }, { merge: true });
-
-        const snap = await getDoc(iRef);
-        if (snap.exists()) {
-          await updateDoc(iRef, {
-            appId: APP_ID, slotId, shelf, level, itemKey,
-            quantity: (Number(snap.data().quantity) || 0) + qty,
-            updatedAt: Date.now(),
-            lastSource: newStock.source
-          });
-        } else {
-          await setDoc(iRef, {
-            appId: APP_ID, slotId, shelf, level,
-            itemKey, type: "steg", quantity: qty,
-            timestamp: Date.now(), updatedAt: Date.now(),
-            lastSource: newStock.source
-          });
-        }
-        setNewStock({ ...newStock, qty: "", itemKey: "" });
-        setActiveTab("inventory");
-      } catch (err) {
-        console.error("Add error:", err);
-      }
-    };
+    const movementsColRef = () => collection(db, "artifacts", APP_ID, "public", "data", "movements");
 
     const entryOptions = useMemo(() => {
       const shelfNum = (s) => Number(String(s).replace("C","")) || 0;
@@ -336,24 +339,103 @@
       return arr;
     }, [itemDocs]);
 
+    const handleAddStock = async (e) => {
+      e.preventDefault();
+      const qty = Number(newStock.qty);
+      const itemKey = newStock.itemKey;
+      const shelf = newStock.shelf;
+      const level = Number(newStock.level);
+      if (!itemKey || !shelf || !level || !qty || qty <= 0) return;
+
+      const slotId = `${shelf}_L${level}`;
+      const sRef = slotDocRef(slotId);
+      const iRef = itemDocRef(slotId, itemKey);
+
+      try {
+        await runTransaction(db, async (tx) => {
+          tx.set(sRef, { appId: APP_ID, slotId, shelf, level, updatedAt: serverTimestamp() }, { merge: true });
+
+          const snap = await tx.get(iRef);
+          const prev = snap.exists() ? (Number(snap.data().quantity) || 0) : 0;
+          const next = prev + qty;
+
+          if (snap.exists()) {
+            tx.update(iRef, {
+              appId: APP_ID, slotId, shelf, level, itemKey,
+              quantity: next,
+              updatedAt: serverTimestamp(),
+              lastSource: newStock.source
+            });
+          } else {
+            tx.set(iRef, {
+              appId: APP_ID, slotId, shelf, level,
+              itemKey, type: "steg",
+              quantity: next,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+              lastSource: newStock.source
+            });
+          }
+
+          // movement log
+          tx.set(doc(movementsColRef()), {
+            type: "in",
+            itemKey,
+            qty,
+            source: newStock.source,
+            to: { slotId, shelf, level },
+            userId: user?.uid || null,
+            at: serverTimestamp()
+          });
+        });
+
+        setNewStock({ ...newStock, qty: "", itemKey: "" });
+        setActiveTab("inventory");
+        pushToast("ok", "Einlagerung gespeichert.");
+      } catch (err) {
+        console.error("Add error:", err);
+        pushToast("err", "Fehler beim Einlagern (siehe Konsole).");
+      }
+    };
+
     const handleRemoveStock = async (e) => {
       e.preventDefault();
       const qty = Number(outStock.qty);
       if (!outStock.entryId || !qty || qty <= 0) return;
 
       const selected = entryOptions.find(x => x.entryId === outStock.entryId);
-      if (!selected || selected.quantity < qty) return;
+      if (!selected) return;
+      if (selected.quantity < qty) { pushToast("err", "Nicht genug Bestand."); return; }
 
       const iRef = itemDocRef(selected.slotId, selected.itemKey);
+
       try {
-        const newQty = selected.quantity - qty;
-        if (newQty <= 0) await deleteDoc(iRef);
-        else await updateDoc(iRef, { quantity: newQty, updatedAt: Date.now(), lastDestination: outStock.destination });
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(iRef);
+          const prev = snap.exists() ? (Number(snap.data().quantity) || 0) : 0;
+          if (prev < qty) throw new Error("Insufficient stock in transaction");
+
+          const next = prev - qty;
+          if (next <= 0) tx.delete(iRef);
+          else tx.update(iRef, { quantity: next, updatedAt: serverTimestamp(), lastDestination: outStock.destination });
+
+          tx.set(doc(movementsColRef()), {
+            type: "out",
+            itemKey: selected.itemKey,
+            qty,
+            destination: outStock.destination,
+            from: { slotId: selected.slotId, shelf: selected.shelf, level: selected.level },
+            userId: user?.uid || null,
+            at: serverTimestamp()
+          });
+        });
 
         setOutStock({ entryId: "", qty: "", destination: "produktion" });
         setActiveTab("inventory");
+        pushToast("ok", "Auslagerung gespeichert.");
       } catch (err) {
         console.error("Remove error:", err);
+        pushToast("err", "Fehler beim Auslagern (siehe Konsole).");
       }
     };
 
@@ -365,6 +447,8 @@
       const qty = Number(moveStock.qty);
       if (!qty || qty <= 0) return;
 
+      if (qty > selected.quantity) { pushToast("err", "Menge ist größer als Bestand."); return; }
+
       const targetShelf = moveStock.targetShelf;
       const targetLevel = Number(moveStock.targetLevel);
       const targetSlotId = `${targetShelf}_L${targetLevel}`;
@@ -374,29 +458,55 @@
       const targetItemRef = itemDocRef(targetSlotId, selected.itemKey);
 
       try {
-        // remove from source
-        const remaining = selected.quantity - qty;
-        if (remaining <= 0) await deleteDoc(sourceRef);
-        else await updateDoc(sourceRef, { quantity: remaining, updatedAt: Date.now() });
+        await runTransaction(db, async (tx) => {
+          // read source
+          const sSnap = await tx.get(sourceRef);
+          const sPrev = sSnap.exists() ? (Number(sSnap.data().quantity) || 0) : 0;
+          if (sPrev < qty) throw new Error("Insufficient stock in transaction (move)");
 
-        // ensure target slot
-        await setDoc(targetSlotRef, { appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel, updatedAt: Date.now() }, { merge: true });
+          // write source
+          const sNext = sPrev - qty;
+          if (sNext <= 0) tx.delete(sourceRef);
+          else tx.update(sourceRef, { quantity: sNext, updatedAt: serverTimestamp() });
 
-        // add to target item
-        const tSnap = await getDoc(targetItemRef);
-        if (tSnap.exists()) {
-          await updateDoc(targetItemRef, { quantity: (Number(tSnap.data().quantity)||0) + qty, updatedAt: Date.now() });
-        } else {
-          await setDoc(targetItemRef, {
-            appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel,
-            itemKey: selected.itemKey, type: "steg", quantity: qty, timestamp: Date.now(), updatedAt: Date.now()
+          // ensure target slot
+          tx.set(targetSlotRef, { appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel, updatedAt: serverTimestamp() }, { merge: true });
+
+          // write target item
+          const tSnap = await tx.get(targetItemRef);
+          const tPrev = tSnap.exists() ? (Number(tSnap.data().quantity) || 0) : 0;
+          const tNext = tPrev + qty;
+
+          if (tSnap.exists()) {
+            tx.update(targetItemRef, { quantity: tNext, updatedAt: serverTimestamp() });
+          } else {
+            tx.set(targetItemRef, {
+              appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel,
+              itemKey: selected.itemKey, type: "steg",
+              quantity: tNext,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            });
+          }
+
+          // movement log
+          tx.set(doc(movementsColRef()), {
+            type: "move",
+            itemKey: selected.itemKey,
+            qty,
+            from: { slotId: selected.slotId, shelf: selected.shelf, level: selected.level },
+            to: { slotId: targetSlotId, shelf: targetShelf, level: targetLevel },
+            userId: user?.uid || null,
+            at: serverTimestamp()
           });
-        }
+        });
 
         setMoveStock({ entryId: "", targetShelf: "C1", targetLevel: 1, qty: "" });
         setActiveTab("inventory");
+        pushToast("ok", "Umlagerung gespeichert.");
       } catch (err) {
         console.error("Move error:", err);
+        pushToast("err", "Fehler beim Umlagern (siehe Konsole).");
       }
     };
 
@@ -409,6 +519,14 @@
 
     return (
       <div className="max-w-4xl mx-auto min-h-screen pb-32 relative">
+        {/* Toast */}
+        {toast && (
+          <div className={`fixed top-3 left-1/2 -translate-x-1/2 z-[1000] px-5 py-3 rounded-2xl shadow-2xl border font-black text-sm
+            ${toast.type === "ok" ? "bg-emerald-600 text-white border-emerald-300" : "bg-rose-600 text-white border-rose-300"}`}>
+            {toast.msg}
+          </div>
+        )}
+
         {/* DEBUG overlay */}
         <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
           <div>RAW docs: <span className="text-slate-900">{rawItems.length}</span></div>
@@ -613,7 +731,7 @@
                     onChange={e => {
                       const entryId = e.target.value;
                       const entry = entryOptions.find(x => x.entryId === entryId);
-                      setMoveStock({ ...moveStock, entryId, qty: entry ? entry.quantity : "" });
+                      setMoveStock({ ...moveStock, entryId, qty: entry ? Math.min(entry.quantity, 1) : "" });
                     }}
                     className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 appearance-none outline-none focus:border-blue-400">
                     <option value="">-- Bestand wählen --</option>
@@ -625,12 +743,25 @@
                   </select>
                 </div>
 
-                <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Stückzahl (Festwert)</label>
-                  <input readOnly type="number" value={moveStock.qty}
-                    className="w-full p-4 bg-slate-200 rounded-2xl font-bold border-2 border-slate-100 outline-none cursor-not-allowed opacity-75" />
-                  <p className="text-[9px] text-slate-400 ml-4 italic mt-1">* Die gesamte Menge dieses Eintrags wird verschoben.</p>
-                </div>
+                {(() => {
+                  const sel = entryOptions.find(x => x.entryId === moveStock.entryId);
+                  const max = sel ? sel.quantity : 0;
+                  return (
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Stückzahl</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max={max || 1}
+                        placeholder="Menge..."
+                        value={moveStock.qty}
+                        onChange={e => setMoveStock({ ...moveStock, qty: e.target.value })}
+                        className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-blue-400"
+                      />
+                      <p className="text-[9px] text-slate-400 ml-4 italic mt-1">* Max: {max || "-"} Stk</p>
+                    </div>
+                  );
+                })()}
 
                 <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-100">
                   <div className="space-y-1">
