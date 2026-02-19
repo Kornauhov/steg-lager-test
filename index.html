@@ -84,25 +84,61 @@
     });
   </script>
 
-  <!--
-    IMPORTANT FIX:
-    Vorher wurde Firebase per <script type="module"> geladen. Module-Skripte werden "deferred" ausgeführt,
-    während das nachfolgende Babel-Script sofort läuft → FirebaseSDK war manchmal noch nicht da.
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
+    import {
+      getFirestore, collection, collectionGroup, doc, setDoc,
+      onSnapshot, deleteDoc, updateDoc, getDoc, query, where, limit
+    } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
 
-    Jetzt laden wir Firebase *innerhalb* des Babel-Skripts via dynamic import(), warten darauf,
-    und starten erst dann React + Firestore.
-  -->
+    window.FirebaseSDK = {
+      initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
+      onSnapshot, deleteDoc, updateDoc, getDoc, query, where, limit,
+      getAuth, signInAnonymously, onAuthStateChanged
+    };
+  </script>
+
   <script type="text/babel">
-    const { useEffect, useMemo, useState, useRef } = React;
+    const { useState, useEffect, useMemo } = React;
 
-    // -----------------------------
-    // Pure helpers (testable)
-    // -----------------------------
+    if (!window.FirebaseSDK) {
+      throw new Error("FirebaseSDK wurde nicht geladen (CSP/Module blockiert oder Netzwerk).");
+    }
+
+    const {
+      initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
+      onSnapshot, deleteDoc, updateDoc, getDoc, query, where, limit,
+      getAuth, signInAnonymously, onAuthStateChanged
+    } = window.FirebaseSDK;
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyBGqPXXcmJTbL3PVrn-PKL0Gig45r6GPbQ",
+      authDomain: "steg-lager-test.firebaseapp.com",
+      databaseURL: "https://steg-lager-test-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "steg-lager-test",
+      storageBucket: "steg-lager-test.firebasestorage.app",
+      messagingSenderId: "655203951825",
+      appId: "1:655203951825:web:9edcfb40f29ed70f61d1f0",
+      measurementId: "G-Q6FX41P556"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    const APP_ID = "stege-lager-v1";
+
+    const Icon = ({ name, size = 20, className = "" }) => {
+      useEffect(() => { if (window.lucide) window.lucide.createIcons(); }, [name, className]);
+      return <i data-lucide={name} style={{ width: size, height: size }} className={className}></i>;
+    };
+
     const safeDocId = (s) => String(s || "").replace(/\//g, "_").trim();
     const slotIdFrom = (shelf, level) => `${String(shelf)}_L${Number(level)}`;
 
     const deriveFromPath = (path) => {
-      const parts = String(path || "").split("/");
+      const parts = String(path).split("/");
       const idx = parts.indexOf("slots");
       if (idx === -1) return { slotId: null, shelf: null, level: null };
       const slotId = parts[idx + 1] || null;
@@ -112,41 +148,376 @@
       return { slotId, shelf: m[1], level: Number(m[2]) };
     };
 
-    // -----------------------------
-    // Minimal test harness (no deps)
-    // -----------------------------
-    function runTests() {
-      const tests = [];
-      const assertEq = (name, a, b) => {
-        const ok = JSON.stringify(a) === JSON.stringify(b);
-        tests.push({ name, ok, a, b });
+    function App() {
+      const [activeTab, setActiveTab] = useState("dashboard");
+      const [loading, setLoading] = useState(true);
+      const [user, setUser] = useState(null);
+
+      const [rawItems, setRawItems] = useState([]);
+      const [stegItems, setStegItems] = useState([]);
+      const [masterItems, setMasterItems] = useState([]);
+      const [searchQuery, setSearchQuery] = useState("");
+
+      const [newStock, setNewStock] = useState({
+        itemKey: "",
+        shelf: "C1",
+        level: 1,
+        qty: "",
+        source: "anlieferung",
+        reference: "",
+        note: ""
+      });
+
+      const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
+      const levels = [5, 4, 3, 2, 1];
+
+      // Auth
+      useEffect(() => {
+        const init = async () => {
+          try { await signInAnonymously(auth); }
+          catch (e) { console.error("Auth Error:", e); }
+        };
+        init();
+
+        const unsub = onAuthStateChanged(auth, (u) => {
+          if (u) { setUser(u); setLoading(false); }
+        });
+        return () => unsub();
+      }, []);
+
+      // Items (server-side filter + fallback by path prefix)
+      useEffect(() => {
+        if (!user) return;
+
+        const basePrefix = `artifacts/${APP_ID}/public/data/slots/`;
+        let unsubPrimary = null;
+        let unsubFallback = null;
+
+        const primaryQ = query(collectionGroup(db, "items"), where("appId", "==", APP_ID));
+
+        unsubPrimary = onSnapshot(primaryQ, (snap) => {
+          const docs = snap.docs.map(d => ({ __path: d.ref.path, __id: d.id, ...d.data() }));
+
+          if (docs.length > 0) {
+            setRawItems(docs);
+            if (unsubFallback) { unsubFallback(); unsubFallback = null; }
+            return;
+          }
+
+          if (!unsubFallback) {
+            const fallbackQ = query(collectionGroup(db, "items"), limit(5000));
+            unsubFallback = onSnapshot(fallbackQ, (snap2) => {
+              const all = snap2.docs.map(d => ({ __path: d.ref.path, __id: d.id, ...d.data() }));
+              const filtered = all.filter(x => (x.__path || "").includes(basePrefix));
+              setRawItems(filtered);
+            }, (err) => console.error("Fallback items fetch error:", err));
+          }
+        }, (err) => console.error("Primary items fetch error:", err));
+
+        return () => {
+          if (unsubPrimary) unsubPrimary();
+          if (unsubFallback) unsubFallback();
+        };
+      }, [user]);
+
+      // Steg + Master
+      useEffect(() => {
+        if (!user) return;
+
+        const unsubSteg = onSnapshot(
+          collection(db, "artifacts", APP_ID, "public", "data", "steg_items"),
+          (snap) => {
+            const items = snap.docs.map(d => {
+              const data = d.data();
+              return { id: d.id, code: data.code || data.name || d.id, ...data };
+            }).sort((a,b) => String(a.code).localeCompare(String(b.code)));
+            setStegItems(items);
+          },
+          (err) => console.error("Steg items fetch error:", err)
+        );
+
+        const unsubMaster = onSnapshot(
+          collection(db, "artifacts", APP_ID, "public", "data", "master_items"),
+          (snap) => setMasterItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
+          (err) => console.error("Master items fetch error:", err)
+        );
+
+        return () => { unsubSteg(); unsubMaster(); };
+      }, [user]);
+
+      const itemDocs = useMemo(() => {
+        const out = [];
+        for (const d of rawItems) {
+          const derived = deriveFromPath(d.__path || "");
+          const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
+          const level = Number(d.level ?? d.location?.level ?? derived.level);
+          const slotId = d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
+          const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
+          const quantity = Number(d.quantity) || 0;
+          if (!shelf || !level || !slotId || !itemKey || quantity <= 0) continue;
+
+          out.push({
+            id: `${slotId}__${safeDocId(itemKey)}`,
+            slotId, shelf, level,
+            itemKey: String(itemKey),
+            quantity,
+            updatedAt: Number(d.updatedAt) || 0
+          });
+        }
+        return out;
+      }, [rawItems]);
+
+      const slotMap = useMemo(() => {
+        const m = new Map();
+        for (const it of itemDocs) {
+          const key = `${it.shelf}|${it.level}`;
+          if (!m.has(key)) m.set(key, []);
+          m.get(key).push(it);
+        }
+        for (const [k, arr] of m.entries()) {
+          arr.sort((a,b) => String(a.itemKey).localeCompare(String(b.itemKey)));
+          m.set(k, arr);
+        }
+        return m;
+      }, [itemDocs]);
+
+      const occupiedSlots = slotMap.size;
+      const totalParts = useMemo(() => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0), [itemDocs]);
+
+      const debug = useMemo(() => ({
+        raw: rawItems.length,
+        normalized: itemDocs.length,
+        slots: occupiedSlots,
+        sum: totalParts
+      }), [rawItems.length, itemDocs.length, occupiedSlots, totalParts]);
+
+      const awbIndex = useMemo(() => {
+        const m = new Map();
+        for (const it of masterItems) {
+          const awb = it?.awb ? String(it.awb) : null;
+          if (!awb) continue;
+          for (const steg of [it?.steg1, it?.steg2]) {
+            if (!steg) continue;
+            const key = String(steg).toUpperCase();
+            if (!m.has(key)) m.set(key, new Set());
+            m.get(key).add(awb);
+          }
+        }
+        return m;
+      }, [masterItems]);
+
+      const getLinkedAWBs = (stegCode) => {
+        const s = awbIndex.get(String(stegCode || "").toUpperCase());
+        return s ? Array.from(s) : [];
       };
 
-      assertEq("safeDocId replaces slashes", safeDocId("A/B/C"), "A_B_C");
-      assertEq("slotIdFrom formats", slotIdFrom("C1", 3), "C1_L3");
-      assertEq(
-        "deriveFromPath extracts slot fields",
-        deriveFromPath("artifacts/x/public/data/slots/C12_L5/items/abc"),
-        { slotId: "C12_L5", shelf: "C12", level: 5 }
-      );
-      assertEq(
-        "deriveFromPath returns nulls when missing",
-        deriveFromPath("artifacts/x/public/data/other/abc"),
-        { slotId: null, shelf: null, level: null }
-      );
+      const groupedSlots = useMemo(() => {
+        const rows = Array.from(slotMap.entries()).map(([key, entries]) => {
+          const [shelf, levelStr] = key.split("|");
+          return { shelf, level: Number(levelStr), entries };
+        });
+        const shelfNum = (s) => Number(String(s).replace("C","")) || 0;
+        rows.sort((a,b) => {
+          const ds = shelfNum(a.shelf) - shelfNum(b.shelf);
+          if (ds !== 0) return ds;
+          return b.level - a.level;
+        });
+        return rows;
+      }, [slotMap]);
 
-      // Normalization test with mixed shapes
-      const mockRaw = [
-        { __path: "artifacts/app/public/data/slots/C1_L1/items/it1", __id: "it1", itemKey: "S1", quantity: 2 },
-        { __path: "artifacts/app/public/data/slots/C1_L1/items/it2", __id: "it2", key: "S2", quantity: 0 }, // filtered (qty 0)
-        { __path: "artifacts/app/public/data/slots/C2_L3/items/it3", __id: "it3", code: "S3", quantity: "7" },
-        { __path: "artifacts/app/public/data/slots/C2_Lx/items/it4", __id: "it4", code: "S4", quantity: 1 }, // malformed slot id
-      ];
+      const filteredSlots = useMemo(() => {
+        const term = searchQuery.trim().toUpperCase();
+        if (!term) return groupedSlots;
+        return groupedSlots.map(slot => {
+          const shelfMatch = String(slot.shelf).toUpperCase().includes(term);
+          const matched = slot.entries.filter(e => {
+            const keyMatch = String(e.itemKey).toUpperCase().includes(term);
+            const awbMatch = getLinkedAWBs(e.itemKey).some(a => String(a).toUpperCase().includes(term));
+            return keyMatch || awbMatch;
+          });
+          const entriesToShow = shelfMatch ? slot.entries : matched;
+          if (!entriesToShow.length) return null;
+          return { ...slot, entries: entriesToShow };
+        }).filter(Boolean);
+      }, [groupedSlots, searchQuery, awbIndex]);
 
-      const normalized = [];
-      for (const d of mockRaw) {
-        const derived = deriveFromPath(d.__path || "");
-        const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
-        const level = Number(d.level ?? d.location?.level ?? derived.level);
-        const slotId = d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
-        const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
+      if (loading) {
+        return (
+          <div className="h-screen flex flex-col items-center justify-center bg-slate-900 text-yellow-500">
+            <div className="w-16 h-16 border-4 border-yellow-500 border-t-transparent rounded-full animate-spin mb-6"></div>
+            <p className="font-black italic uppercase tracking-widest">System wird initialisiert...</p>
+          </div>
+        );
+      }
+
+      return (
+        <div className="max-w-4xl mx-auto min-h-screen pb-32 relative">
+          {/* Debug overlay (kein Reparatur-Button mehr) */}
+          <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
+            <div>RAW docs: <span className="text-slate-900">{debug.raw}</span></div>
+            <div>Normalized: <span className="text-slate-900">{debug.normalized}</span></div>
+            <div>Slots: <span className="text-slate-900">{debug.slots}</span></div>
+            <div>Sum qty: <span className="text-slate-900">{debug.sum}</span></div>
+          </div>
+
+          <header className="bg-slate-900 text-white p-6 rounded-b-[2.5rem] shadow-2xl border-b-4 border-yellow-500 sticky top-0 z-50">
+            <div className="flex justify-between items-center max-w-2xl mx-auto">
+              <div>
+                <h1 className="text-2xl font-black italic tracking-tighter uppercase leading-none">
+                  Smart Steg <span className="text-yellow-500">PRO</span>
+                </h1>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
+                  Lagerverwaltung Kran-Gestell
+                </p>
+              </div>
+              <div className="bg-slate-800 p-3 rounded-2xl text-yellow-500 shadow-inner">
+                <Icon name="factory" size={24} />
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-2xl mx-auto mt-6 px-4">
+            {activeTab === "dashboard" && (
+              <div className="space-y-6">
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
+                    <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Stege DB</p>
+                    <p className="text-2xl font-black text-slate-800 leading-none">{stegItems.length}</p>
+                  </div>
+                  <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
+                    <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Teile Gesamt</p>
+                    <p className="text-2xl font-black text-yellow-600 leading-none">{totalParts}</p>
+                  </div>
+                  <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
+                    <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Belegte Plätze</p>
+                    <p className="text-2xl font-black text-slate-800 leading-none">{occupiedSlots}/190</p>
+                  </div>
+                </div>
+
+                <div className="bg-slate-900 p-6 rounded-[2.5rem] shadow-2xl text-white">
+                  <div className="flex justify-between items-center mb-6">
+                    <h3 className="text-xs font-black uppercase text-yellow-500 tracking-widest flex items-center gap-2">
+                      <Icon name="grid" size={16} /> Aktuelle Belegung
+                    </h3>
+                    <span className="text-[10px] text-slate-500 font-bold">Gestell C1 - C38</span>
+                  </div>
+
+                  <div className="overflow-x-auto custom-scrollbar pb-4">
+                    <div className="flex gap-2 min-w-max px-2">
+                      {shelves.map(s => (
+                        <div key={s} className="flex flex-col gap-1.5 items-center">
+                          <span className="text-[8px] font-black text-slate-500 mb-1">{s}</span>
+                          {levels.map(l => {
+                            const entries = slotMap.get(`${s}|${l}`) || [];
+                            const count = entries.length;
+                            return (
+                              <div
+                                key={l}
+                                className={`w-6 h-6 rounded-md grid-cell shadow-inner flex items-center justify-center ${
+                                  count ? "bg-yellow-500 shadow-yellow-500/20" : "bg-slate-800 opacity-20"
+                                }`}
+                                title={count ? `${count} Sorten` : "leer"}
+                              >
+                                {count ? <span className="text-[10px] font-black text-slate-900">{count}</span> : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 text-[10px] text-slate-400 font-bold">
+                    * Zahl im Feld = Anzahl verschiedener Sorten im Platz
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === "inventory" && (
+              <div className="space-y-4">
+                <div className="relative">
+                  <input
+                    placeholder="Suche Steg, Regal (C1...) oder Profil/AWB..."
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                    className="w-full px-6 py-4 bg-white rounded-3xl shadow-lg outline-none font-bold text-slate-800 border-2 border-transparent focus:border-yellow-400 transition-all"
+                  />
+                  <div className="absolute right-5 top-4 text-slate-300"><Icon name="search" /></div>
+                </div>
+
+                <div className="space-y-3">
+                  {filteredSlots.length === 0 ? (
+                    <div className="bg-white p-6 rounded-[2rem] shadow-sm border border-slate-200 text-slate-500 font-bold italic">
+                      Keine Treffer / kein Bestand.
+                    </div>
+                  ) : filteredSlots.map(slot => (
+                    <div key={`${slot.shelf}|${slot.level}`} className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-[15px] font-black bg-slate-900 text-yellow-500 px-3 py-1 rounded-full">
+                          {slot.shelf} - L{slot.level}
+                        </span>
+                        <span className="text-[11px] font-black text-slate-500 uppercase">
+                          {slot.entries.length} Sorten
+                        </span>
+                      </div>
+
+                      <div className="space-y-2">
+                        {slot.entries.map(entry => {
+                          const linked = getLinkedAWBs(entry.itemKey);
+                          return (
+                            <div key={entry.id} className="flex items-center justify-between bg-slate-50 rounded-2xl px-4 py-3 border border-slate-100">
+                              <div className="min-w-0 pr-3">
+                                <div className="font-black text-slate-800 truncate">{entry.itemKey}</div>
+                                <div className="text-[11px] text-slate-400 font-bold uppercase truncate">
+                                  {linked.length ? `Ref: ${linked.join(" | ")}` : "Einzel-Komponente"}
+                                </div>
+                              </div>
+                              <div className="bg-white text-slate-800 px-4 py-2 rounded-xl font-black text-lg border border-slate-200">
+                                {entry.quantity}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </main>
+
+          <nav className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[92%] max-w-[520px] glass-effect rounded-[2.5rem] p-2 flex justify-around shadow-2xl border border-white/10 z-[100]">
+            <NavBtn active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} icon="layout-dashboard" label="Home" />
+            <NavBtn active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} icon="boxes" label="Bestand" />
+            <NavBtn active={activeTab === "add"} onClick={() => setActiveTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
+          </nav>
+        </div>
+      );
+    }
+
+    const NavBtn = ({ active, onClick, icon, label, color = "yellow" }) => {
+      const activeColors = { yellow: "bg-yellow-500 text-slate-900", emerald: "bg-emerald-500 text-white" };
+      return (
+        <button
+          onClick={onClick}
+          className={`flex flex-col items-center gap-1 p-2.5 px-3 rounded-3xl transition-all duration-300 ${
+            active ? activeColors[color] + " scale-105 shadow-xl" : "text-slate-500 hover:text-slate-300"
+          }`}
+        >
+          <i data-lucide={icon} style={{ width: 18, height: 18 }}></i>
+          <span className="text-[7px] font-black uppercase tracking-tighter">{label}</span>
+        </button>
+      );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+
+    window.__APP_STARTED__ = true;
+    const boot = document.getElementById("boot");
+    if (boot) boot.style.display = "none";
+
+    root.render(<App />);
+  </script>
+</body>
+</html>
