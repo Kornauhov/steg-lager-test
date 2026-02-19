@@ -819,205 +819,127 @@
     };
 
     // Scan batch move: source shelf -> top occupied level + ALL items, target shelf -> next free level
-    const handleBatchMoveFromSlot = async ({ sourceShelf, sourceLevel, targetShelf }) => {
-      const sourceSlotId = `${sourceShelf}_L${sourceLevel}`;
-      const entries = slotMap.get(`${sourceShelf}|${sourceLevel}`) || [];
-      if (!entries.length) {
-        pushToast("err", `Quelle ${sourceShelf}-L${sourceLevel} ist leer.`);
-        return;
+   const handleBatchMoveFromSlot = async ({ sourceShelf, sourceLevel, targetShelf }) => {
+  const sourceSlotId = `${sourceShelf}_L${sourceLevel}`;
+  const entries = slotMap.get(`${sourceShelf}|${sourceLevel}`) || [];
+  if (!entries.length) {
+    pushToast("err", `Quelle ${sourceShelf}-L${sourceLevel} ist leer.`);
+    return;
+  }
+
+  // Ziel: nächste freie Ebene (von oben nach unten)
+  let targetLevel = pickNextFreeLevel(slotMap, targetShelf, levels);
+  if (!targetLevel) {
+    pushToast("err", `Zielregal ${targetShelf} hat keine freie Ebene (Fallback L1).`);
+    targetLevel = 1;
+  }
+  const targetSlotId = `${targetShelf}_L${targetLevel}`;
+
+  const targetSlotRef = slotDocRef(targetSlotId);
+
+  try {
+    await runTransaction(db, async (tx) => {
+      // -------------------------
+      // 1) READ PHASE (ALLES LESEN)
+      // -------------------------
+      const pairs = entries.map(e => {
+        const itemKey = e.itemKey;
+        return {
+          itemKey,
+          sRef: itemDocRef(sourceSlotId, itemKey),
+          tRef: itemDocRef(targetSlotId, itemKey),
+        };
+      });
+
+      // Alle Reads in Arrays sammeln
+      const sSnaps = [];
+      const tSnaps = [];
+
+      for (const p of pairs) {
+        sSnaps.push(await tx.get(p.sRef));
+      }
+      for (const p of pairs) {
+        tSnaps.push(await tx.get(p.tRef));
       }
 
-      let targetLevel = pickNextFreeLevel(slotMap, targetShelf, levels);
-      if (!targetLevel) {
-        pushToast("err", `Zielregal ${targetShelf} hat keine freie Ebene (Fallback L1).`);
-        targetLevel = 1;
-      }
-      const targetSlotId = `${targetShelf}_L${targetLevel}`;
-      const targetSlotRef = slotDocRef(targetSlotId);
+      // Plan bauen (was wird wirklich bewegt?)
+      const plan = [];
+      for (let i = 0; i < pairs.length; i++) {
+        const p = pairs[i];
+        const sSnap = sSnaps[i];
+        const tSnap = tSnaps[i];
 
-      try {
-        await runTransaction(db, async (tx) => {
-          // ensure target slot
-          tx.set(
-            targetSlotRef,
-            { appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel, updatedAt: serverTimestamp() },
-            { merge: true }
-          );
+        const sQty = sSnap.exists() ? (Number(sSnap.data().quantity) || 0) : 0;
+        if (sQty <= 0) continue;
 
-          const movedItems = [];
-
-          // move EACH item fully
-          for (const e of entries) {
-            const sourceRef = itemDocRef(sourceSlotId, e.itemKey);
-            const targetRef = itemDocRef(targetSlotId, e.itemKey);
-
-            const sSnap = await tx.get(sourceRef);
-            const sPrev = sSnap.exists() ? (Number(sSnap.data().quantity) || 0) : 0;
-            if (sPrev <= 0) continue;
-
-            // delete source (full move)
-            tx.delete(sourceRef);
-
-            // add to target (merge quantities)
-            const tSnap = await tx.get(targetRef);
-            const tPrev = tSnap.exists() ? (Number(tSnap.data().quantity) || 0) : 0;
-            const tNext = tPrev + sPrev;
-
-            if (tSnap.exists()) {
-              tx.update(targetRef, { quantity: tNext, updatedAt: serverTimestamp() });
-            } else {
-              tx.set(targetRef, {
-                appId: APP_ID,
-                slotId: targetSlotId,
-                shelf: targetShelf,
-                level: targetLevel,
-                itemKey: e.itemKey,
-                type: "steg",
-                quantity: tNext,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp()
-              });
-            }
-
-            movedItems.push({ itemKey: e.itemKey, qty: sPrev });
-          }
-
-          // one movement log for batch
-          tx.set(doc(movementsColRef()), {
-            type: "move_batch",
-            from: { slotId: sourceSlotId, shelf: sourceShelf, level: sourceLevel },
-            to: { slotId: targetSlotId, shelf: targetShelf, level: targetLevel },
-            items: movedItems,
-            userId: user?.uid || null,
-            at: serverTimestamp()
-          });
+        const tQty = tSnap.exists() ? (Number(tSnap.data().quantity) || 0) : 0;
+        plan.push({
+          itemKey: p.itemKey,
+          sRef: p.sRef,
+          tRef: p.tRef,
+          sQty,
+          tQty,
+          tExists: tSnap.exists()
         });
-
-        pushToast("ok", `Umlagert: ${sourceShelf}-L${sourceLevel} → ${targetShelf}-L${targetLevel}`);
-      } catch (err) {
-        console.error("Batch move error:", err);
-        pushToast("err", "Fehler beim Scan-Umlagern (siehe Konsole).");
       }
-    };
 
-    if (loading) return (
-      <div className="h-screen flex flex-col items-center justify-center bg-slate-900 text-yellow-500">
-        <div className="w-16 h-16 border-4 border-yellow-500 border-t-transparent rounded-full animate-spin mb-6"></div>
-        <p className="font-black italic uppercase tracking-widest">System wird initialisiert...</p>
-      </div>
-    );
+      if (!plan.length) {
+        throw new Error("Quelle hat keine positiven Mengen (TX).");
+      }
 
-    return (
-      <div className="max-w-4xl mx-auto min-h-screen pb-32 relative">
-        {/* Toast */}
-        {toast && (
-          <div className={`fixed top-3 left-1/2 -translate-x-1/2 z-[2100] px-5 py-3 rounded-2xl shadow-2xl border font-black text-sm
-            ${toast.type === "ok" ? "bg-emerald-600 text-white border-emerald-300" : "bg-rose-600 text-white border-rose-300"}`}>
-            {toast.msg}
-          </div>
-        )}
+      // -------------------------
+      // 2) WRITE PHASE (NUR SCHREIBEN)
+      // -------------------------
+      tx.set(
+        targetSlotRef,
+        { appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
 
-        {/* DEBUG overlay */}
-        <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
-          <div>RAW docs: <span className="text-slate-900">{rawItems.length}</span></div>
-          <div>APP docs: <span className="text-slate-900">{itemDocs.length}</span></div>
-          <div>Slots: <span className="text-slate-900">{occupiedSlots}</span></div>
-          <div>Sum qty: <span className="text-slate-900">{totalParts}</span></div>
-          <div>Moves: <span className="text-slate-900">{movements.length}</span></div>
-        </div>
+      const movedItems = [];
 
-        <header className="bg-slate-900 text-white p-6 rounded-b-[2.5rem] shadow-2xl border-b-4 border-yellow-500 sticky top-0 z-50">
-          <div className="flex justify-between items-center max-w-2xl mx-auto">
-            <div>
-              <h1 className="text-2xl font-black italic tracking-tighter uppercase leading-none">
-                Smart Steg <span className="text-yellow-500">PRO</span>
-              </h1>
-              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
-                Lagerverwaltung Kran-Gestell
-              </p>
-            </div>
-            <div className="bg-slate-800 p-3 rounded-2xl text-yellow-500 shadow-inner">
-              <Icon name="factory" size={24} />
-            </div>
-          </div>
-        </header>
+      for (const p of plan) {
+        // Quelle komplett entfernen
+        tx.delete(p.sRef);
 
-        <main className="max-w-2xl mx-auto mt-6 px-4">
-          {/* DASHBOARD */}
-          {activeTab === "dashboard" && (
-            <div className="space-y-6">
-              <div className="grid grid-cols-3 gap-3">
-                <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                  <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Stege DB</p>
-                  <p className="text-2xl font-black text-slate-800 leading-none">{stegItems.length}</p>
-                </div>
-                <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                  <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Teile Gesamt</p>
-                  <p className="text-2xl font-black text-yellow-600 leading-none">{totalParts}</p>
-                </div>
-                <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                  <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Belegte Plätze</p>
-                  <p className="text-2xl font-black text-slate-800 leading-none">{occupiedSlots}/190</p>
-                </div>
-              </div>
+        // Ziel addieren/erzeugen
+        const next = p.tQty + p.sQty;
+        if (p.tExists) {
+          tx.update(p.tRef, { quantity: next, updatedAt: serverTimestamp() });
+        } else {
+          tx.set(p.tRef, {
+            appId: APP_ID,
+            slotId: targetSlotId,
+            shelf: targetShelf,
+            level: targetLevel,
+            itemKey: p.itemKey,
+            type: "steg",
+            quantity: next,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        }
 
-              <div className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200 flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[10px] font-black uppercase text-slate-400">Exports</div>
-                  <div className="font-black text-slate-800">CSV für Abgleich / Inventur</div>
-                </div>
-                <div className="flex gap-2">
-                  <button onClick={exportInventoryCSV}
-                    className="px-4 py-3 rounded-2xl bg-slate-900 text-yellow-500 font-black text-xs uppercase shadow active:scale-95">
-                    Bestand CSV
-                  </button>
-                  <button onClick={() => setActiveTab("history")}
-                    className="px-4 py-3 rounded-2xl bg-yellow-500 text-slate-900 font-black text-xs uppercase shadow active:scale-95">
-                    Historie
-                  </button>
-                </div>
-              </div>
+        movedItems.push({ itemKey: p.itemKey, qty: p.sQty });
+      }
 
-              <div className="bg-slate-900 p-6 rounded-[2.5rem] shadow-2xl text-white">
-                <div className="flex justify-between items-center mb-6">
-                  <h3 className="text-xs font-black uppercase text-yellow-500 tracking-widest flex items-center gap-2">
-                    <Icon name="grid" size={16} /> Aktuelle Belegung
-                  </h3>
-                  <span className="text-[10px] text-slate-500 font-bold">Gestell C1 - C38</span>
-                </div>
+      // Log
+      tx.set(doc(movementsColRef()), {
+        type: "move_batch",
+        from: { slotId: sourceSlotId, shelf: sourceShelf, level: sourceLevel },
+        to: { slotId: targetSlotId, shelf: targetShelf, level: targetLevel },
+        items: movedItems,
+        userId: user?.uid || null,
+        at: serverTimestamp()
+      });
+    });
 
-                <div className="overflow-x-auto custom-scrollbar pb-4">
-                  <div className="flex gap-2 min-w-max px-2">
-                    {shelves.map(s => (
-                      <div key={s} className="flex flex-col gap-1.5 items-center">
-                        <span className="text-[8px] font-black text-slate-500 mb-1">{s}</span>
-                        {levels.map(l => {
-                          const entries = slotMap.get(`${s}|${l}`) || [];
-                          const count = entries.length;
-                          return (
-                            <button
-                              key={l}
-                              onClick={() => setSlotPopup({ open: true, shelf: s, level: l })}
-                              className={`w-6 h-6 rounded-md grid-cell shadow-inner flex items-center justify-center
-                                ${count ? "bg-yellow-500 shadow-yellow-500/20" : "bg-slate-800 opacity-20"}`}
-                              title={`${s}-L${l}`}
-                            >
-                              {count ? <span className="text-[10px] font-black text-slate-900">{count}</span> : null}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="mt-4 text-[10px] text-slate-400 font-bold">
-                  * Zahl im Feld = Anzahl verschiedener Sorten im Platz (Tippen öffnet Details)
-                </div>
-              </div>
-            </div>
-          )}
-
+    pushToast("ok", `Umlagert: ${sourceShelf}-L${sourceLevel} → ${targetShelf}-L${targetLevel}`);
+  } catch (err) {
+    console.error("Batch move error:", err);
+    pushToast("err", "Fehler beim Scan-Umlagern (siehe Konsole).");
+  }
+};
           {/* INVENTORY */}
           {activeTab === "inventory" && (
             <div className="space-y-4">
