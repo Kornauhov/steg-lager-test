@@ -83,7 +83,6 @@
     <i data-lucide={name} style={{ width: size, height: size }} className={className}></i>
   );
 
-  // robustere Doc-ID
   const safeDocId = (s) => {
     const x = String(s ?? "")
       .trim()
@@ -95,7 +94,6 @@
 
   const slotIdFrom = (shelf, level) => `${String(shelf)}_L${Number(level)}`;
 
-  // derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
   const deriveFromPath = (path) => {
     const parts = String(path).split("/");
     const idx = parts.indexOf("slots");
@@ -107,6 +105,37 @@
     return { slotId, shelf: m[1], level: Number(m[2]) };
   };
 
+  // ---------- CSV helpers ----------
+  const fmtDateTime = (ts) => {
+    try {
+      if (!ts) return "";
+      const d = typeof ts?.toDate === "function" ? ts.toDate() : (ts instanceof Date ? ts : new Date(ts));
+      if (Number.isNaN(d.getTime())) return "";
+      return new Intl.DateTimeFormat("de-DE", {
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      }).format(d);
+    } catch { return ""; }
+  };
+
+  const csvEscape = (v) => {
+    const s = String(v ?? "");
+    // Always quote to be safe (commas/newlines)
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+
+  const downloadTextFile = (filename, text, mime = "text/plain;charset=utf-8") => {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   function App() {
     const [activeTab, setActiveTab] = useState("dashboard");
     const [loading, setLoading] = useState(true);
@@ -116,13 +145,16 @@
     const [stegItems, setStegItems] = useState([]);
     const [masterItems, setMasterItems] = useState([]);
 
+    // NEW: movements
+    const [movements, setMovements] = useState([]);
+    const [historyQuery, setHistoryQuery] = useState("");
+
     const [searchQuery, setSearchQuery] = useState("");
 
     const [newStock, setNewStock] = useState({ itemKey: "", shelf: "C1", level: 1, qty: "", source: "anlieferung" });
     const [outStock, setOutStock] = useState({ entryId: "", qty: "", destination: "produktion" });
     const [moveStock, setMoveStock] = useState({ entryId: "", targetShelf: "C1", targetLevel: 1, qty: "" });
 
-    // tiny toast
     const [toast, setToast] = useState(null);
     const pushToast = useCallback((type, msg) => {
       setToast({ type, msg, id: Math.random().toString(36).slice(2) });
@@ -148,15 +180,18 @@
 
     useEffect(() => {
       if (window.lucide) window.lucide.createIcons();
-    }, [activeTab, rawItems.length, stegItems.length, toast?.id]);
+    }, [activeTab, rawItems.length, stegItems.length, toast?.id, movements.length]);
+
+    // Firestore refs
+    const slotDocRef = (slotId) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId);
+    const itemDocRef = (slotId, itemKey) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items", safeDocId(itemKey));
+    const movementsColRef = () => collection(db, "artifacts", APP_ID, "public", "data", "movements");
 
     useEffect(() => {
       if (!user) return;
 
-      // ✅ Versuch: scoped collectionGroup by appId (schneller/sauberer)
-      //    Fallback: unfiltered, falls Index/Query-Probleme.
+      // items listener: try scoped, fallback unfiltered
       let unsubItems = null;
-
       const startItemsListener = () => {
         const scopedQ = query(collectionGroup(db, "items"), where("appId", "==", APP_ID));
         unsubItems = onSnapshot(
@@ -180,7 +215,6 @@
           }
         );
       };
-
       startItemsListener();
 
       const unsubSteg = onSnapshot(
@@ -201,17 +235,28 @@
         (err) => console.error("Master items fetch error:", err)
       );
 
+      // NEW: movements live (latest 300)
+      const movQ = query(movementsColRef(), orderBy("at", "desc"), limit(300));
+      const unsubMov = onSnapshot(
+        movQ,
+        (snap) => {
+          const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setMovements(docs);
+        },
+        (err) => console.error("Movements fetch error:", err)
+      );
+
       return () => {
         if (unsubItems) unsubItems();
         unsubSteg();
         unsubMaster();
+        unsubMov();
       };
     }, [user]);
 
-    // Filter client-side by appId OR by path containing "/artifacts/stege-lager-v1/"
+    // items normalization
     const itemDocs = useMemo(() => {
       const out = [];
-
       for (const d of rawItems) {
         const path = d.__path || "";
         const pathHasApp = path.includes(`artifacts/${APP_ID}/`);
@@ -242,7 +287,6 @@
           quantity
         });
       }
-
       return out;
     }, [rawItems]);
 
@@ -314,11 +358,6 @@
       }).filter(Boolean);
     }, [groupedSlots, searchQuery, awbIndex]);
 
-    // Firestore refs
-    const slotDocRef = (slotId) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId);
-    const itemDocRef = (slotId, itemKey) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items", safeDocId(itemKey));
-    const movementsColRef = () => collection(db, "artifacts", APP_ID, "public", "data", "movements");
-
     const entryOptions = useMemo(() => {
       const shelfNum = (s) => Number(String(s).replace("C","")) || 0;
       const arr = itemDocs.map(x => ({
@@ -339,6 +378,7 @@
       return arr;
     }, [itemDocs]);
 
+    // ---------- Write handlers (transactions + movements log) ----------
     const handleAddStock = async (e) => {
       e.preventDefault();
       const qty = Number(newStock.qty);
@@ -377,7 +417,6 @@
             });
           }
 
-          // movement log
           tx.set(doc(movementsColRef()), {
             type: "in",
             itemKey,
@@ -459,20 +498,16 @@
 
       try {
         await runTransaction(db, async (tx) => {
-          // read source
           const sSnap = await tx.get(sourceRef);
           const sPrev = sSnap.exists() ? (Number(sSnap.data().quantity) || 0) : 0;
           if (sPrev < qty) throw new Error("Insufficient stock in transaction (move)");
 
-          // write source
           const sNext = sPrev - qty;
           if (sNext <= 0) tx.delete(sourceRef);
           else tx.update(sourceRef, { quantity: sNext, updatedAt: serverTimestamp() });
 
-          // ensure target slot
           tx.set(targetSlotRef, { appId: APP_ID, slotId: targetSlotId, shelf: targetShelf, level: targetLevel, updatedAt: serverTimestamp() }, { merge: true });
 
-          // write target item
           const tSnap = await tx.get(targetItemRef);
           const tPrev = tSnap.exists() ? (Number(tSnap.data().quantity) || 0) : 0;
           const tNext = tPrev + qty;
@@ -489,7 +524,6 @@
             });
           }
 
-          // movement log
           tx.set(doc(movementsColRef()), {
             type: "move",
             itemKey: selected.itemKey,
@@ -510,6 +544,57 @@
       }
     };
 
+    // ---------- CSV Export ----------
+    const exportInventoryCSV = () => {
+      const header = ["shelf","level","slotId","itemKey","quantity","linkedAWBs"].map(csvEscape).join(",");
+      const rows = itemDocs
+        .slice()
+        .sort((a,b) => (a.shelf.localeCompare(b.shelf) || (b.level - a.level) || a.itemKey.localeCompare(b.itemKey)))
+        .map(x => {
+          const awbs = getLinkedAWBs(x.itemKey).join(" | ");
+          return [x.shelf, x.level, x.slotId, x.itemKey, x.quantity, awbs].map(csvEscape).join(",");
+        });
+      const csv = [header, ...rows].join("\n");
+      downloadTextFile(`bestand_${APP_ID}.csv`, csv, "text/csv;charset=utf-8");
+      pushToast("ok", "Bestand CSV exportiert.");
+    };
+
+    const exportMovementsCSV = () => {
+      const header = ["at","type","itemKey","qty","fromSlot","toSlot","source","destination","userId"].map(csvEscape).join(",");
+      const rows = movements.map(m => {
+        const fromSlot = m?.from?.slotId || "";
+        const toSlot   = m?.to?.slotId || "";
+        return [
+          fmtDateTime(m.at),
+          m.type || "",
+          m.itemKey || "",
+          m.qty ?? "",
+          fromSlot,
+          toSlot,
+          m.source || "",
+          m.destination || "",
+          m.userId || ""
+        ].map(csvEscape).join(",");
+      });
+      const csv = [header, ...rows].join("\n");
+      downloadTextFile(`bewegungen_${APP_ID}.csv`, csv, "text/csv;charset=utf-8");
+      pushToast("ok", "Bewegungen CSV exportiert.");
+    };
+
+    // History filtering
+    const filteredMovements = useMemo(() => {
+      const term = historyQuery.trim().toUpperCase();
+      if (!term) return movements;
+      return movements.filter(m => {
+        const t = [
+          m.type, m.itemKey, m.source, m.destination, m.userId,
+          m?.from?.slotId, m?.to?.slotId,
+          m?.from?.shelf, m?.to?.shelf
+        ].filter(Boolean).join(" ").toUpperCase();
+        return t.includes(term);
+      });
+    }, [movements, historyQuery]);
+
     if (loading) return (
       <div className="h-screen flex flex-col items-center justify-center bg-slate-900 text-yellow-500">
         <div className="w-16 h-16 border-4 border-yellow-500 border-t-transparent rounded-full animate-spin mb-6"></div>
@@ -519,7 +604,6 @@
 
     return (
       <div className="max-w-4xl mx-auto min-h-screen pb-32 relative">
-        {/* Toast */}
         {toast && (
           <div className={`fixed top-3 left-1/2 -translate-x-1/2 z-[1000] px-5 py-3 rounded-2xl shadow-2xl border font-black text-sm
             ${toast.type === "ok" ? "bg-emerald-600 text-white border-emerald-300" : "bg-rose-600 text-white border-rose-300"}`}>
@@ -533,6 +617,7 @@
           <div>APP docs: <span className="text-slate-900">{itemDocs.length}</span></div>
           <div>Slots: <span className="text-slate-900">{occupiedSlots}</span></div>
           <div>Sum qty: <span className="text-slate-900">{totalParts}</span></div>
+          <div>Moves: <span className="text-slate-900">{movements.length}</span></div>
         </div>
 
         <header className="bg-slate-900 text-white p-6 rounded-b-[2.5rem] shadow-2xl border-b-4 border-yellow-500 sticky top-0 z-50">
@@ -566,6 +651,23 @@
                 <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
                   <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Belegte Plätze</p>
                   <p className="text-2xl font-black text-slate-800 leading-none">{occupiedSlots}/190</p>
+                </div>
+              </div>
+
+              <div className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[10px] font-black uppercase text-slate-400">Exports</div>
+                  <div className="font-black text-slate-800">CSV für Abgleich / Inventur</div>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={exportInventoryCSV}
+                    className="px-4 py-3 rounded-2xl bg-slate-900 text-yellow-500 font-black text-xs uppercase shadow active:scale-95">
+                    Bestand CSV
+                  </button>
+                  <button onClick={() => { setActiveTab("history"); }}
+                    className="px-4 py-3 rounded-2xl bg-yellow-500 text-slate-900 font-black text-xs uppercase shadow active:scale-95">
+                    Historie
+                  </button>
                 </div>
               </div>
 
@@ -616,6 +718,17 @@
                 <div className="absolute right-5 top-4 text-slate-300"><Icon name="search" /></div>
               </div>
 
+              <div className="flex gap-2">
+                <button onClick={exportInventoryCSV}
+                  className="flex-1 py-4 bg-slate-900 text-yellow-500 rounded-[1.5rem] font-black uppercase shadow active:scale-95">
+                  Bestand CSV export
+                </button>
+                <button onClick={() => setActiveTab("history")}
+                  className="px-5 py-4 bg-white border border-slate-200 rounded-[1.5rem] font-black uppercase text-slate-800 shadow-sm active:scale-95">
+                  Historie
+                </button>
+              </div>
+
               <div className="space-y-3">
                 {filteredSlots.length === 0 ? (
                   <div className="bg-white p-6 rounded-[2rem] shadow-sm border border-slate-200 text-slate-500 font-bold italic">
@@ -653,6 +766,94 @@
                   </div>
                 ))}
               </div>
+            </div>
+          )}
+
+          {activeTab === "history" && (
+            <div className="space-y-4">
+              <div className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[10px] font-black uppercase text-slate-400">Bewegungs-Historie</div>
+                    <div className="font-black text-slate-800">Letzte Buchungen (live)</div>
+                  </div>
+                  <button onClick={exportMovementsCSV}
+                    className="px-4 py-3 rounded-2xl bg-slate-900 text-yellow-500 font-black text-xs uppercase shadow active:scale-95">
+                    Historie CSV
+                  </button>
+                </div>
+
+                <div className="mt-4 relative">
+                  <input
+                    placeholder="Filter: Steg, Slot (C1_L1), Typ, userId..."
+                    value={historyQuery}
+                    onChange={e => setHistoryQuery(e.target.value)}
+                    className="w-full px-6 py-4 bg-slate-50 rounded-3xl outline-none font-bold text-slate-800 border-2 border-slate-100 focus:border-yellow-400 transition-all"
+                  />
+                  <div className="absolute right-5 top-4 text-slate-300"><Icon name="search" /></div>
+                </div>
+              </div>
+
+              {filteredMovements.length === 0 ? (
+                <div className="bg-white p-6 rounded-[2rem] shadow-sm border border-slate-200 text-slate-500 font-bold italic">
+                  Keine Buchungen vorhanden.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {filteredMovements.slice(0, 200).map(m => {
+                    const typeLabel =
+                      m.type === "in" ? "EINGANG" :
+                      m.type === "out" ? "AUSGANG" :
+                      m.type === "move" ? "MOVE" : (m.type || "???");
+
+                    const typeStyle =
+                      m.type === "in" ? "bg-emerald-100 text-emerald-700" :
+                      m.type === "out" ? "bg-rose-100 text-rose-700" :
+                      m.type === "move" ? "bg-blue-100 text-blue-700" :
+                      "bg-slate-100 text-slate-700";
+
+                    const fromSlot = m?.from?.slotId ? `${m.from.slotId}` : "";
+                    const toSlot = m?.to?.slotId ? `${m.to.slotId}` : "";
+
+                    return (
+                      <div key={m.id} className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`px-3 py-1 rounded-full text-[10px] font-black ${typeStyle}`}>{typeLabel}</span>
+                              <span className="text-[11px] font-black text-slate-500">{fmtDateTime(m.at)}</span>
+                            </div>
+                            <div className="mt-2 font-black text-slate-900 truncate">{m.itemKey || "-"}</div>
+                            <div className="text-[11px] text-slate-500 font-bold mt-1">
+                              {m.type === "in" && (
+                                <>Quelle: <span className="text-slate-800">{m.source || "-"}</span> → Ziel: <span className="text-slate-800">{toSlot || "-"}</span></>
+                              )}
+                              {m.type === "out" && (
+                                <>Von: <span className="text-slate-800">{fromSlot || "-"}</span> → Zweck: <span className="text-slate-800">{m.destination || "-"}</span></>
+                              )}
+                              {m.type === "move" && (
+                                <>Von: <span className="text-slate-800">{fromSlot || "-"}</span> → Nach: <span className="text-slate-800">{toSlot || "-"}</span></>
+                              )}
+                              {!["in","out","move"].includes(m.type) && (
+                                <>Von: <span className="text-slate-800">{fromSlot || "-"}</span> → Nach: <span className="text-slate-800">{toSlot || "-"}</span></>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-400 font-bold mt-2 truncate">
+                              user: {m.userId || "-"}
+                            </div>
+                          </div>
+                          <div className="shrink-0 bg-slate-900 text-yellow-500 px-4 py-2 rounded-xl font-black text-lg border border-slate-800">
+                            {Number(m.qty) || 0}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="text-center text-[10px] text-slate-500 font-bold">
+                    * Anzeige limitiert auf 200 Einträge (CSV exportiert alle geladenen).
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -836,9 +1037,10 @@
           )}
         </main>
 
-        <nav className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[92%] max-w-[520px] glass-effect rounded-[2.5rem] p-2 flex justify-around shadow-2xl border border-white/10 z-[100]">
+        <nav className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[92%] max-w-[560px] glass-effect rounded-[2.5rem] p-2 flex justify-around shadow-2xl border border-white/10 z-[100]">
           <NavBtn active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} icon="layout-dashboard" label="Home" />
           <NavBtn active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} icon="boxes" label="Bestand" />
+          <NavBtn active={activeTab === "history"} onClick={() => setActiveTab("history")} icon="history" label="Log" />
           <NavBtn active={activeTab === "add"} onClick={() => setActiveTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
           <NavBtn active={activeTab === "move"} onClick={() => setActiveTab("move")} icon="shuffle" label="Umlagern" color="blue" />
           <NavBtn active={activeTab === "outbound"} onClick={() => setActiveTab("outbound")} icon="arrow-up-right-from-circle" label="Ausgang" color="rose" />
