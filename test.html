@@ -1,201 +1,311 @@
-import React, { useState, useEffect } from 'react';
-import { initializeApp } from 'firebase/app';
-import { 
-  getFirestore, 
-  collection, 
-  getDocs, 
-  updateDoc, 
-  doc, 
-  signInWithCustomToken
-} from 'firebase/firestore';
-import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { Loader2, Database, CheckCircle2, AlertCircle, RefreshCw } from 'lucide-react';
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Firestore AppID Patch</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50">
+  <div class="max-w-2xl mx-auto p-6">
+    <div class="bg-white rounded-3xl shadow-sm border border-slate-200 p-6">
+      <h1 class="text-xl font-black italic text-slate-900">Firestore: appId hinzufügen</h1>
+      <p class="text-sm text-slate-500 font-bold mt-1">
+        Diese Seite fügt <span class="font-black text-slate-800">NUR</span> das Feld <code class="bg-slate-100 px-2 py-1 rounded">appId</code> hinzu,
+        wenn es fehlt. (Public Zugang bleibt wie deine Rules es erlauben.)
+      </p>
 
-// Firebase Konfiguration aus der Umgebung
-const firebaseConfig = JSON.parse(__firebase_config);
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'stege-lager-v1';
-
-const App = () => {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [processing, setProcessing] = useState(false);
-  const [status, setStatus] = useState({ type: 'info', message: 'Bereit zur Aktualisierung' });
-  const [stats, setStats] = useState({ total: 0, updated: 0 });
-
-  // Pfad-Definition basierend auf deinen Vorgaben
-  const collectionPath = `artifacts/${appId}/public/data/master_items`;
-
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (error) {
-        console.error("Auth Fehler:", error);
-        setStatus({ type: 'error', message: 'Authentifizierung fehlgeschlagen.' });
-      }
-    };
-    initAuth();
-
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setUser(user);
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  const runUpdate = async () => {
-    if (!user) return;
-    
-    setProcessing(true);
-    setStatus({ type: 'info', message: 'Rufe Daten ab...' });
-    setStats({ total: 0, updated: 0 });
-
-    try {
-      // 1. Alle Dokumente aus der Collection holen
-      const itemsCol = collection(db, 'artifacts', appId, 'public', 'data', 'master_items');
-      const snapshot = await getDocs(itemsCol);
-      
-      const total = snapshot.size;
-      setStats(prev => ({ ...prev, total }));
-
-      if (total === 0) {
-        setStatus({ type: 'warning', message: 'Keine Dokumente im Pfad gefunden.' });
-        setProcessing(false);
-        return;
-      }
-
-      // 2. Jedes Dokument einzeln aktualisieren mit der gewünschten Struktur
-      let count = 0;
-      for (const itemDoc of snapshot.docs) {
-        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'master_items', itemDoc.id);
-        const currentData = itemDoc.data();
-
-        await updateDoc(docRef, {
-          appID: "stege-lager-v1",                      // (string)
-          awb: currentData.awb || "6001-001",           // (string)
-          lastUpdate: new Date().toISOString(),         // (ISO string timestamp)
-          length: Number(currentData.length) || 6000,   // (number)
-          steg1: currentData.steg1 || "284013",         // (string)
-          steg2: currentData.steg2 || "284037",         // (string)
-          steg3: currentData.steg3 || "",               // (string)
-          steg4: currentData.steg4 || ""                // (string)
-        });
-
-        count++;
-        setStats(prev => ({ ...prev, updated: count }));
-      }
-
-      setStatus({ 
-        type: 'success', 
-        message: `Erfolgreich abgeschlossen! ${count} Dokumente wurden in der DB aktualisiert.` 
-      });
-    } catch (error) {
-      console.error("Update Fehler:", error);
-      setStatus({ 
-        type: 'error', 
-        message: `Fehler beim Schreiben in die DB: ${error.message}` 
-      });
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 p-4 md:p-8 font-sans">
-      <div className="max-w-2xl mx-auto bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 overflow-hidden">
-        
-        {/* Header */}
-        <div className="p-8 bg-slate-800 border-b border-slate-700 text-center">
-            <div className="inline-flex p-3 bg-blue-500/10 rounded-full mb-4">
-                <Database className="w-8 h-8 text-blue-500" />
-            </div>
-            <h1 className="text-2xl font-bold text-white">Cloud DB Updater</h1>
-            <p className="text-slate-400 mt-1">Pfad: <code className="text-blue-400">/{collectionPath}</code></p>
-        </div>
-
-        {/* Status Message */}
-        <div className="p-6">
-          <div className={`flex items-start p-4 rounded-xl border ${
-            status.type === 'error' ? 'bg-red-500/10 border-red-500/50 text-red-400' :
-            status.type === 'success' ? 'bg-green-500/10 border-green-500/50 text-green-400' :
-            status.type === 'warning' ? 'bg-yellow-500/10 border-yellow-500/50 text-yellow-400' :
-            'bg-blue-500/10 border-blue-500/50 text-blue-400'
-          }`}>
-            <div className="mr-3 mt-0.5">
-              {status.type === 'error' ? <AlertCircle className="w-5 h-5" /> :
-               status.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> :
-               <RefreshCw className={`w-5 h-5 ${processing ? 'animate-spin' : ''}`} />}
+      <div class="mt-6 grid gap-4">
+        <div class="bg-slate-900 text-yellow-500 rounded-2xl p-4">
+          <div class="text-xs font-black uppercase tracking-widest">Konfiguration</div>
+          <div class="mt-3 grid sm:grid-cols-2 gap-3">
+            <div>
+              <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">APP_ID</label>
+              <input id="appId" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-yellow-400 font-black outline-none"
+                     value="stege-lager-v1" />
             </div>
             <div>
-              <p className="font-medium">{status.message}</p>
-              {stats.total > 0 && (
-                <p className="text-sm opacity-80 mt-1">
-                  Fortschritt: {stats.updated} / {stats.total} Dokumente
+              <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">PROJECT_ID (nur Info)</label>
+              <input id="projectId" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 font-black outline-none"
+                     value="steg-lager-test" />
+            </div>
+          </div>
+
+          <div class="mt-4 grid gap-2">
+            <label class="flex items-center gap-3 text-sm font-black text-slate-100">
+              <input id="doItems" type="checkbox" class="w-5 h-5" checked />
+              items patchen (slots/*/items via collectionGroup)
+            </label>
+            <label class="flex items-center gap-3 text-sm font-black text-slate-100">
+              <input id="doStock" type="checkbox" class="w-5 h-5" />
+              stock_entries patchen (optional)
+            </label>
+            <label class="flex items-center gap-3 text-sm font-black text-slate-100">
+              <input id="dryRun" type="checkbox" class="w-5 h-5" checked />
+              Dry-Run (nur zählen, nichts schreiben)
+            </label>
+            <div class="grid sm:grid-cols-2 gap-3 mt-2">
+              <div>
+                <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">Max Updates pro Lauf</label>
+                <input id="maxUpdates" type="number" min="1" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 font-black outline-none"
+                       value="500" />
+                <p class="text-[11px] text-slate-300 font-bold mt-1">
+                  (Firestore Batch-Limit: 500 Writes)
                 </p>
-              )}
+              </div>
+              <div>
+                <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">Scan Page Size</label>
+                <input id="pageSize" type="number" min="50" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 font-black outline-none"
+                       value="500" />
+              </div>
             </div>
           </div>
+        </div>
 
-          {/* Progress Bar */}
-          {processing && (
-            <div className="mt-6 w-full bg-slate-700 rounded-full h-2 overflow-hidden">
-              <div 
-                className="bg-blue-500 h-full transition-all duration-300"
-                style={{ width: `${(stats.updated / stats.total) * 100}%` }}
-              ></div>
-            </div>
-          )}
+        <div class="flex flex-col sm:flex-row gap-3">
+          <button id="btnRun"
+                  class="flex-1 py-4 rounded-2xl bg-emerald-600 text-white font-black uppercase shadow-lg active:scale-[0.99] transition">
+            Start
+          </button>
+          <button id="btnStop"
+                  class="sm:w-48 py-4 rounded-2xl bg-slate-200 text-slate-700 font-black uppercase active:scale-[0.99] transition">
+            Stop
+          </button>
+        </div>
 
-          {/* Action Button */}
-          <div className="mt-8">
-            <button
-              onClick={runUpdate}
-              disabled={processing || !user}
-              className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center transition-all ${
-                processing || !user
-                  ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
-                  : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/20 active:scale-[0.98]'
-              }`}
-            >
-              {processing ? (
-                <>
-                  <Loader2 className="w-5 h-5 mr-3 animate-spin" />
-                  Schreibe in DB...
-                </>
-              ) : (
-                'appID & Felder aktualisieren'
-              )}
-            </button>
-            <div className="mt-6 p-4 bg-slate-900/50 rounded-lg border border-slate-700">
-                <p className="text-xs text-slate-500 uppercase font-semibold mb-2 tracking-wider">Geplante Struktur pro Feld:</p>
-                <ul className="text-xs space-y-1 text-slate-400 font-mono">
-                    <li>appID: "stege-lager-v1" (string)</li>
-                    <li>awb: "6001-001" (string)</li>
-                    <li>lastUpdate: [ISO-Timestamp] (string)</li>
-                    <li>length: 6000 (number)</li>
-                    <li>steg1-4: [Werte] (string)</li>
-                </ul>
-            </div>
+        <div class="bg-white rounded-3xl border border-slate-200 p-5">
+          <div class="flex items-center justify-between">
+            <div class="text-xs font-black uppercase tracking-widest text-slate-500">Status</div>
+            <div id="badge" class="text-[10px] font-black uppercase px-3 py-1 rounded-full bg-slate-100 text-slate-700">bereit</div>
           </div>
+          <div class="mt-3 text-sm font-bold text-slate-700">
+            <div>Gescannte Docs: <span id="scanned" class="font-black">0</span></div>
+            <div>Fehlende appId: <span id="missing" class="font-black">0</span></div>
+            <div>Geschrieben: <span id="written" class="font-black">0</span></div>
+          </div>
+
+          <pre id="log" class="mt-4 bg-slate-900 text-slate-100 rounded-2xl p-4 text-[12px] overflow-auto max-h-72 whitespace-pre-wrap"></pre>
+        </div>
+
+        <div class="text-[12px] text-slate-500 font-bold">
+          Hinweis: Für <b>collectionGroup("items")</b> brauchst du ggf. einen Index, je nach Query.
+          Wir scannen hier ohne where-filter und filtern dann per Pfad-Prefix:
+          <code class="bg-slate-100 px-2 py-1 rounded">artifacts/&lt;APP_ID&gt;/public/data/slots/</code>
         </div>
       </div>
     </div>
-  );
-};
+  </div>
 
-export default App;
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
+    import {
+      getFirestore,
+      collection,
+      collectionGroup,
+      doc,
+      query,
+      orderBy,
+      startAfter,
+      limit,
+      getDocs,
+      writeBatch,
+      FieldPath
+    } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
+    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
+
+    // === Deine Firebase Config (wie in deiner App) ===
+    const firebaseConfig = {
+      apiKey: "AIzaSyBGqPXXcmJTbL3PVrn-PKL0Gig45r6GPbQ",
+      authDomain: "steg-lager-test.firebaseapp.com",
+      databaseURL: "https://steg-lager-test-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "steg-lager-test",
+      storageBucket: "steg-lager-test.firebasestorage.app",
+      messagingSenderId: "655203951825",
+      appId: "1:655203951825:web:9edcfb40f29ed70f61d1f0",
+      measurementId: "G-Q6FX41P556"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const auth = getAuth(app);
+
+    // UI helpers
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+
+    const setBadge = (text, kind = "ready") => {
+      const b = $("badge");
+      b.textContent = text;
+      b.className = "text-[10px] font-black uppercase px-3 py-1 rounded-full " + (
+        kind === "run" ? "bg-emerald-100 text-emerald-700" :
+        kind === "stop" ? "bg-rose-100 text-rose-700" :
+        kind === "warn" ? "bg-yellow-100 text-yellow-700" :
+        "bg-slate-100 text-slate-700"
+      );
+    };
+
+    const appendLog = (line) => {
+      logEl.textContent += (logEl.textContent ? "\n" : "") + line;
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    let shouldStop = false;
+
+    $("btnStop").addEventListener("click", () => {
+      shouldStop = true;
+      setBadge("stop…", "stop");
+      appendLog("STOP angefordert…");
+    });
+
+    $("btnRun").addEventListener("click", async () => {
+      shouldStop = false;
+      logEl.textContent = "";
+      $("scanned").textContent = "0";
+      $("missing").textContent = "0";
+      $("written").textContent = "0";
+
+      setBadge("auth…", "run");
+      appendLog("Anon Auth…");
+
+      try {
+        await signInAnonymously(auth);
+      } catch (e) {
+        setBadge("auth error", "stop");
+        appendLog("AUTH ERROR: " + (e?.message || e));
+        return;
+      }
+
+      const APP_ID = $("appId").value.trim();
+      const doItems = $("doItems").checked;
+      const doStock = $("doStock").checked;
+      const dryRun = $("dryRun").checked;
+      const maxUpdates = Math.max(1, Number($("maxUpdates").value) || 500);
+      const pageSize = Math.max(50, Number($("pageSize").value) || 500);
+
+      const PATH_PREFIX = `artifacts/${APP_ID}/public/data/slots/`;
+
+      appendLog(`APP_ID = ${APP_ID}`);
+      appendLog(`PATH_PREFIX = ${PATH_PREFIX}`);
+      appendLog(`DryRun = ${dryRun}`);
+      appendLog(`MaxUpdates = ${maxUpdates}`);
+      appendLog(`PageSize = ${pageSize}`);
+      appendLog(`Targets: items=${doItems}, stock_entries=${doStock}`);
+
+      setBadge("laufend", "run");
+
+      let scanned = 0;
+      let missing = 0;
+      let written = 0;
+
+      const bump = () => {
+        $("scanned").textContent = String(scanned);
+        $("missing").textContent = String(missing);
+        $("written").textContent = String(written);
+      };
+
+      // Helper: batch update up to 500 refs
+      const batchUpdate = async (refs, patch) => {
+        if (dryRun) return 0;
+        const b = writeBatch(db);
+        for (const r of refs) b.update(r, patch);
+        await b.commit();
+        return refs.length;
+      };
+
+      // 1) items via collectionGroup("items") – scan in pages
+      if (doItems) {
+        appendLog("\n[items] Scan collectionGroup('items')…");
+        let lastDoc = null;
+
+        // We orderBy documentId to paginate reliably
+        while (!shouldStop) {
+          const q = lastDoc
+            ? query(collectionGroup(db, "items"), orderBy(FieldPath.documentId()), startAfter(lastDoc), limit(pageSize))
+            : query(collectionGroup(db, "items"), orderBy(FieldPath.documentId()), limit(pageSize));
+
+          const snap = await getDocs(q);
+          if (snap.empty) break;
+
+          // collect missing appId docs in our path
+          const toWriteRefs = [];
+          snap.forEach((d) => {
+            scanned++;
+            const data = d.data() || {};
+            const hasAppId = typeof data.appId === "string" && data.appId.length > 0;
+            const inOurPath = d.ref.path.includes(PATH_PREFIX);
+            if (inOurPath && !hasAppId) {
+              missing++;
+              if (toWriteRefs.length < Math.min(500, maxUpdates - written)) {
+                toWriteRefs.push(d.ref);
+              }
+            }
+          });
+
+          bump();
+
+          if (toWriteRefs.length > 0) {
+            const n = await batchUpdate(toWriteRefs, { appId: APP_ID });
+            written += n;
+            bump();
+            appendLog(`[items] batch commit: ${n} updates`);
+          }
+
+          // stop if reached maxUpdates
+          if (!dryRun && written >= maxUpdates) {
+            appendLog(`[items] MaxUpdates erreicht (${maxUpdates}).`);
+            break;
+          }
+
+          lastDoc = snap.docs[snap.docs.length - 1];
+          if (snap.size < pageSize) break;
+        }
+
+        appendLog(`[items] done. scanned=${scanned}, missing=${missing}, written=${written}`);
+      }
+
+      // 2) stock_entries (optional)
+      if (doStock && !shouldStop) {
+        appendLog("\n[stock_entries] Scan artifacts/APP_ID/public/data/stock_entries …");
+        // stock_entries is a single collection; we scan in one go (usually not huge)
+        const stockCol = collection(db, "artifacts", APP_ID, "public", "data", "stock_entries");
+        const snap = await getDocs(stockCol);
+
+        const toWriteRefs = [];
+        snap.forEach((d) => {
+          scanned++;
+          const data = d.data() || {};
+          const hasAppId = typeof data.appId === "string" && data.appId.length > 0;
+          if (!hasAppId) {
+            missing++;
+            if (toWriteRefs.length < Math.min(500, maxUpdates - written)) {
+              toWriteRefs.push(d.ref);
+            }
+          }
+        });
+
+        bump();
+
+        if (toWriteRefs.length > 0) {
+          const n = await batchUpdate(toWriteRefs, { appId: APP_ID });
+          written += n;
+          bump();
+          appendLog(`[stock_entries] commit: ${n} updates`);
+        }
+
+        appendLog(`[stock_entries] done.`);
+      }
+
+      if (shouldStop) {
+        setBadge("gestoppt", "stop");
+        appendLog("\nSTOP: Vorgang abgebrochen.");
+      } else if (dryRun) {
+        setBadge("dry-run fertig", "warn");
+        appendLog("\nDRY-RUN fertig (nichts geschrieben).");
+      } else {
+        setBadge("fertig", "ready");
+        appendLog("\nFERTIG ✅");
+      }
+    });
+  </script>
+</body>
+</html>
