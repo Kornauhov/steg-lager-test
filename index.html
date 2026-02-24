@@ -17,8 +17,8 @@
     .custom-scrollbar::-webkit-scrollbar { height: 6px; width: 6px; }
     .custom-scrollbar::-webkit-scrollbar-thumb { background: #facc15; border-radius: 10px; }
     .custom-scrollbar::-webkit-scrollbar-track { background: #0f172a; }
-    .grid-cell { transition: all 0.2s ease-in-out; }
-    .grid-cell:active { transform: scale(0.9); }
+    .grid-cell { transition: all 0.15s ease-in-out; }
+    .grid-cell:active { transform: scale(0.92); }
     .glass-effect { background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(10px); }
   </style>
 </head>
@@ -29,40 +29,28 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
   import {
-    getFirestore,
-    collection,
-    doc,
-    setDoc,
-    onSnapshot,
-    deleteDoc,
-    updateDoc,
-    getDoc
+    getFirestore, collection, collectionGroup, doc, setDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc, query
   } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
   import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
 
   window.FirebaseSDK = {
-    initializeApp,
-    getFirestore,
-    collection,
-    doc,
-    setDoc,
-    onSnapshot,
-    deleteDoc,
-    updateDoc,
-    getDoc,
-    getAuth,
-    signInAnonymously,
-    onAuthStateChanged
+    initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc, query,
+    getAuth, signInAnonymously, onAuthStateChanged
   };
 </script>
 
 <script type="text/babel">
-  const { useState, useEffect, useMemo, useRef } = React;
+  const { useState, useEffect, useMemo } = React;
   const {
-    initializeApp, getFirestore, collection, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc,
+    initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc, query,
     getAuth, signInAnonymously, onAuthStateChanged
   } = window.FirebaseSDK;
+
+  // ===== UI flags =====
+  const DEBUG = false; // ✅ Debug overlay an/aus
 
   const firebaseConfig = {
     apiKey: "AIzaSyBGqPXXcmJTbL3PVrn-PKL0Gig45r6GPbQ",
@@ -88,7 +76,7 @@
   const safeDocId = (s) => String(s || "").replace(/\//g, "_").trim();
   const slotIdFrom = (shelf, level) => `${String(shelf)}_L${Number(level)}`;
 
-  // derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
+  // ✅ derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
   const deriveFromPath = (path) => {
     const parts = String(path).split("/");
     const idx = parts.indexOf("slots");
@@ -98,7 +86,7 @@
 
     const m = String(slotId).match(/^(.+)_L(\d+)$/);
     if (!m) return { slotId, shelf: null, level: null };
-    return { slotId, shelf: m[1], level: Number(m[2]) };
+    return { slotId: m[0], shelf: m[1], level: Number(m[2]) };
   };
 
   function App() {
@@ -106,7 +94,7 @@
     const [loading, setLoading] = useState(true);
     const [user, setUser] = useState(null);
 
-    // raw docs from firestore (scoped listeners: only this APP_ID)
+    // raw docs from firestore (no filter)
     const [rawItems, setRawItems] = useState([]);
     const [stegItems, setStegItems] = useState([]);
     const [masterItems, setMasterItems] = useState([]);
@@ -121,10 +109,6 @@
     const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
     const levels = [5, 4, 3, 2, 1];
 
-    // holds item unsubscribers per slotId
-    const itemUnsubsRef = useRef(new Map());
-    const unsubSlotsRef = useRef(null);
-
     useEffect(() => {
       const init = async () => {
         try { await signInAnonymously(auth); }
@@ -138,81 +122,26 @@
       return () => unsub();
     }, []);
 
-    // ✅ optimization: create lucide icons once
     useEffect(() => {
       if (window.lucide) window.lucide.createIcons();
-    }, []);
-
-    // create icons when content changes (optional, keeps icons always correct)
-    useEffect(() => {
-      if (window.lucide) window.lucide.createIcons();
-    }, [activeTab, rawItems.length]);
+    }, [activeTab, rawItems.length, stegItems.length, masterItems.length, searchQuery]);
 
     useEffect(() => {
       if (!user) return;
 
-      // ✅ PROBLEM 2 FIX:
-      // Scoped listeners only under: artifacts/{APP_ID}/public/data/slots/{slotId}/items/{itemId}
-      // No collectionGroup("items") anymore.
-      const slotsRef = collection(db, "artifacts", APP_ID, "public", "data", "slots");
-
-      // cleanup any previous listeners (if hot reload etc.)
-      if (unsubSlotsRef.current) {
-        try { unsubSlotsRef.current(); } catch {}
-        unsubSlotsRef.current = null;
-      }
-      for (const unsub of itemUnsubsRef.current.values()) {
-        try { unsub(); } catch {}
-      }
-      itemUnsubsRef.current.clear();
-      setRawItems([]); // reset to avoid stale data
-
-      unsubSlotsRef.current = onSnapshot(
-        slotsRef,
-        (slotsSnap) => {
-          const slotIds = slotsSnap.docs.map(d => d.id);
-
-          // remove listeners for slots that disappeared
-          for (const [slotId, unsub] of itemUnsubsRef.current.entries()) {
-            if (!slotIds.includes(slotId)) {
-              try { unsub(); } catch {}
-              itemUnsubsRef.current.delete(slotId);
-              // also remove items belonging to that slot from state
-              setRawItems(prev => prev.filter(x => x.__slotId !== slotId));
-            }
-          }
-
-          // add listeners for new slots
-          for (const slotId of slotIds) {
-            if (itemUnsubsRef.current.has(slotId)) continue;
-
-            const itemsRef = collection(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items");
-
-            const unsubItems = onSnapshot(
-              itemsRef,
-              (itemsSnap) => {
-                setRawItems(prev => {
-                  // remove old items of this slot
-                  const cleaned = prev.filter(x => x.__slotId !== slotId);
-
-                  // add latest
-                  const next = itemsSnap.docs.map(d => ({
-                    __path: d.ref.path,
-                    __id: d.id,
-                    __slotId: slotId,
-                    ...d.data()
-                  }));
-
-                  return [...cleaned, ...next];
-                });
-              },
-              (err) => console.error("Items fetch error (slot):", slotId, err)
-            );
-
-            itemUnsubsRef.current.set(slotId, unsubItems);
-          }
+      const itemsQ = query(collectionGroup(db, "items"));
+      const unsubItems = onSnapshot(
+        itemsQ,
+        (snap) => {
+          const docs = snap.docs.map(d => ({
+            __path: d.ref.path,
+            __id: d.id,
+            ...d.data()
+          }));
+          if (DEBUG) console.log("RAW items snap:", snap.size, docs.slice(0,3));
+          setRawItems(docs);
         },
-        (err) => console.error("Slots fetch error:", err)
+        (err) => console.error("Items fetch error:", err)
       );
 
       const unsubSteg = onSnapshot(
@@ -233,29 +162,20 @@
         (err) => console.error("Master items fetch error:", err)
       );
 
-      return () => {
-        // slots listener
-        if (unsubSlotsRef.current) {
-          try { unsubSlotsRef.current(); } catch {}
-          unsubSlotsRef.current = null;
-        }
-        // items listeners
-        for (const unsub of itemUnsubsRef.current.values()) {
-          try { unsub(); } catch {}
-        }
-        itemUnsubsRef.current.clear();
-
-        unsubSteg();
-        unsubMaster();
-      };
+      return () => { unsubItems(); unsubSteg(); unsubMaster(); };
     }, [user]);
 
-    // items normalized
+    // ✅ Filter client-side by appId OR by path containing "/artifacts/stege-lager-v1/"
     const itemDocs = useMemo(() => {
       const out = [];
 
       for (const d of rawItems) {
         const path = d.__path || "";
+        const pathHasApp = path.includes(`artifacts/${APP_ID}/`);
+        const fieldHasApp = String(d.appId || "") === APP_ID;
+
+        if (!pathHasApp && !fieldHasApp) continue;
+
         const derived = deriveFromPath(path);
 
         const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
@@ -284,7 +204,7 @@
       return out;
     }, [rawItems]);
 
-    // slotMap for dashboard/inventory
+    // ✅ slotMap for dashboard/inventory
     const slotMap = useMemo(() => {
       const m = new Map();
       for (const it of itemDocs) {
@@ -341,20 +261,24 @@
     const filteredSlots = useMemo(() => {
       const term = searchQuery.trim().toUpperCase();
       if (!term) return groupedSlots;
+
       return groupedSlots.map(slot => {
         const shelfMatch = String(slot.shelf).toUpperCase().includes(term);
+
         const matched = slot.entries.filter(e => {
           const keyMatch = String(e.itemKey).toUpperCase().includes(term);
           const awbMatch = getLinkedAWBs(e.itemKey).some(a => String(a).toUpperCase().includes(term));
-          return keyMatch || awbMatch;
+          const lvlMatch = `L${slot.level}`.includes(term);
+          return keyMatch || awbMatch || shelfMatch || lvlMatch;
         });
+
         const entriesToShow = shelfMatch ? slot.entries : matched;
         if (!entriesToShow.length) return null;
         return { ...slot, entries: entriesToShow };
       }).filter(Boolean);
     }, [groupedSlots, searchQuery, awbIndex]);
 
-    // Firestore refs for writes
+    // Firestore refs for writes (new model)
     const slotDocRef = (slotId) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId);
     const itemDocRef = (slotId, itemKey) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items", safeDocId(itemKey));
 
@@ -422,7 +346,12 @@
       if (!outStock.entryId || !qty || qty <= 0) return;
 
       const selected = entryOptions.find(x => x.entryId === outStock.entryId);
-      if (!selected || selected.quantity < qty) return;
+      if (!selected) return;
+
+      if (selected.quantity < qty) {
+        alert("❗ Entnahmemenge ist größer als der aktuelle Bestand.");
+        return;
+      }
 
       const iRef = itemDocRef(selected.slotId, selected.itemKey);
       try {
@@ -444,6 +373,11 @@
 
       const qty = Number(moveStock.qty);
       if (!qty || qty <= 0) return;
+
+      if (qty > selected.quantity) {
+        alert("❗ Umlager-Menge ist größer als der aktuelle Bestand.");
+        return;
+      }
 
       const targetShelf = moveStock.targetShelf;
       const targetLevel = Number(moveStock.targetLevel);
@@ -488,14 +422,16 @@
     );
 
     return (
-      <div className="max-w-4xl mx-auto min-h-screen pb-32 relative">
+      <div className="max-w-4xl mx-auto min-h-screen pb-36 relative">
         {/* DEBUG overlay */}
-        <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
-          <div>RAW docs: <span className="text-slate-900">{rawItems.length}</span></div>
-          <div>APP docs: <span className="text-slate-900">{itemDocs.length}</span></div>
-          <div>Slots: <span className="text-slate-900">{occupiedSlots}</span></div>
-          <div>Sum qty: <span className="text-slate-900">{totalParts}</span></div>
-        </div>
+        {DEBUG && (
+          <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
+            <div>RAW docs: <span className="text-slate-900">{rawItems.length}</span></div>
+            <div>APP docs: <span className="text-slate-900">{itemDocs.length}</span></div>
+            <div>Slots: <span className="text-slate-900">{occupiedSlots}</span></div>
+            <div>Sum qty: <span className="text-slate-900">{totalParts}</span></div>
+          </div>
+        )}
 
         <header className="bg-slate-900 text-white p-6 rounded-b-[2.5rem] shadow-2xl border-b-4 border-yellow-500 sticky top-0 z-50">
           <div className="flex justify-between items-center max-w-2xl mx-auto">
@@ -547,10 +483,20 @@
                         {levels.map(l => {
                           const entries = slotMap.get(`${s}|${l}`) || [];
                           const count = entries.length;
+
                           return (
-                            <div key={l} className={`w-6 h-6 rounded-md grid-cell shadow-inner flex items-center justify-center
-                              ${count ? "bg-yellow-500 shadow-yellow-500/20" : "bg-slate-800 opacity-20"}`}>
-                              {count ? <span className="text-[10px] font-black text-slate-900">{count}</span> : null}
+                            <div
+                              key={l}
+                              onClick={() => {
+                                if (!count) return;
+                                setSearchQuery(`${s}`);     // ✅ schnell nach Regal filtern
+                                setActiveTab("inventory");  // ✅ direkt zu Bestand springen
+                              }}
+                              className={`w-7 h-7 rounded-lg grid-cell shadow-inner flex items-center justify-center cursor-pointer
+                                ${count ? "bg-yellow-500 shadow-yellow-500/20" : "bg-slate-800 opacity-20 cursor-default"}`}
+                              title={`${s} - L${l}`}
+                            >
+                              {count ? <span className="text-[11px] font-black text-slate-900">{count}</span> : null}
                             </div>
                           );
                         })}
@@ -560,7 +506,7 @@
                 </div>
 
                 <div className="mt-4 text-[10px] text-slate-400 font-bold">
-                  * Zahl im Feld = Anzahl verschiedener Sorten im Platz
+                  * Zahl im Feld = Anzahl verschiedener Sorten im Platz (Tippen öffnet Bestand)
                 </div>
               </div>
             </div>
@@ -573,9 +519,34 @@
                   placeholder="Suche Steg, Regal (C1...) oder Profil/AWB..."
                   value={searchQuery}
                   onChange={e => setSearchQuery(e.target.value)}
-                  className="w-full px-6 py-4 bg-white rounded-3xl shadow-lg outline-none font-bold text-slate-800 border-2 border-transparent focus:border-yellow-400 transition-all"
+                  className="w-full px-6 py-4 pr-24 bg-white rounded-3xl shadow-lg outline-none font-bold text-slate-800 border-2 border-transparent focus:border-yellow-400 transition-all"
                 />
-                <div className="absolute right-5 top-4 text-slate-300"><Icon name="search" /></div>
+                <div className="absolute right-5 top-4 flex items-center gap-2">
+                  {searchQuery.trim() && (
+                    <button
+                      onClick={() => setSearchQuery("")}
+                      className="bg-slate-100 hover:bg-slate-200 text-slate-600 font-black text-[11px] px-3 py-1.5 rounded-full active:scale-95"
+                      title="Suche löschen"
+                    >
+                      X
+                    </button>
+                  )}
+                  <div className="text-slate-300"><Icon name="search" size={20} /></div>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between px-1">
+                <div className="text-[11px] font-bold text-slate-500">
+                  Treffer: <span className="text-slate-900">{filteredSlots.length}</span>
+                </div>
+                {searchQuery.trim() && (
+                  <button
+                    onClick={() => setSearchQuery("")}
+                    className="text-[11px] font-black text-yellow-800 bg-yellow-100 px-3 py-1.5 rounded-full active:scale-95"
+                  >
+                    Zurücksetzen
+                  </button>
+                )}
               </div>
 
               <div className="space-y-3">
@@ -590,7 +561,7 @@
                         {slot.shelf} - L{slot.level}
                       </span>
                       <span className="text-[11px] font-black text-slate-500 uppercase">
-                        {slot.entries.length} Sorten
+                        {slot.entries.length} Stege
                       </span>
                     </div>
 
@@ -605,8 +576,12 @@
                                 {linked.length ? `Ref: ${linked.join(" | ")}` : "Einzel-Komponente"}
                               </div>
                             </div>
-                            <div className="bg-white text-slate-800 px-4 py-2 rounded-xl font-black text-lg border border-slate-200">
-                              {entry.quantity}
+
+                            <div className="text-right">
+                              <div className="text-[10px] font-black uppercase text-slate-400">Stk</div>
+                              <div className="bg-white text-slate-900 px-4 py-2 rounded-2xl font-black text-2xl border border-slate-200 shadow-sm min-w-[84px] text-center">
+                                {entry.quantity}
+                              </div>
                             </div>
                           </div>
                         );
@@ -672,7 +647,7 @@
                     className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-emerald-400" />
                 </div>
 
-                <button type="submit" className="w-full py-5 bg-emerald-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-emerald-600/20 active:scale-95 transition-all">
+                <button type="submit" className="w-full py-5 bg-emerald-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-emerald-600/20 active:scale-95 transition-all sticky bottom-4">
                   Einlagern bestätigen
                 </button>
               </form>
@@ -706,10 +681,16 @@
                 </div>
 
                 <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Stückzahl (Festwert)</label>
-                  <input readOnly type="number" value={moveStock.qty}
-                    className="w-full p-4 bg-slate-200 rounded-2xl font-bold border-2 border-slate-100 outline-none cursor-not-allowed opacity-75" />
-                  <p className="text-[9px] text-slate-400 ml-4 italic mt-1">* Die gesamte Menge dieses Eintrags wird verschoben.</p>
+                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Stückzahl</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max={(entryOptions.find(x => x.entryId === moveStock.entryId)?.quantity) || 1}
+                    value={moveStock.qty}
+                    onChange={e => setMoveStock({ ...moveStock, qty: e.target.value })}
+                    className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-blue-400"
+                  />
+                  <p className="text-[9px] text-slate-400 ml-4 italic mt-1">* Teilmenge möglich (max = aktueller Bestand).</p>
                 </div>
 
                 <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-100">
@@ -730,7 +711,7 @@
                 </div>
 
                 <button type="submit" disabled={!moveStock.entryId}
-                  className={`w-full py-5 text-white rounded-[1.5rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
+                  className={`w-full py-5 text-white rounded-[1.5rem] font-black uppercase shadow-lg active:scale-95 transition-all sticky bottom-4 ${
                     moveStock.entryId ? "bg-blue-600 shadow-blue-600/20" : "bg-slate-300 shadow-none cursor-not-allowed"
                   }`}>
                   Umlagerung ausführen
@@ -777,7 +758,7 @@
                     className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-rose-400" />
                 </div>
 
-                <button type="submit" className="w-full py-5 bg-rose-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-rose-600/20 active:scale-95 transition-all">
+                <button type="submit" className="w-full py-5 bg-rose-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-rose-600/20 active:scale-95 transition-all sticky bottom-4">
                   Auslagern bestätigen
                 </button>
               </form>
@@ -785,7 +766,7 @@
           )}
         </main>
 
-        <nav className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[92%] max-w-[520px] glass-effect rounded-[2.5rem] p-2 flex justify-around shadow-2xl border border-white/10 z-[100]">
+        <nav className="fixed bottom-5 left-1/2 -translate-x-1/2 w-[94%] max-w-[560px] glass-effect rounded-[2.5rem] p-2.5 flex justify-around shadow-2xl border border-white/10 z-[100]">
           <NavBtn active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} icon="layout-dashboard" label="Home" />
           <NavBtn active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} icon="boxes" label="Bestand" />
           <NavBtn active={activeTab === "add"} onClick={() => setActiveTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
@@ -797,14 +778,24 @@
   }
 
   const NavBtn = ({ active, onClick, icon, label, color = "yellow" }) => {
-    const activeColors = { yellow: "bg-yellow-500 text-slate-900", emerald: "bg-emerald-500 text-white", rose: "bg-rose-500 text-white", blue: "bg-blue-500 text-white" };
+    const activeColors = {
+      yellow: "bg-yellow-500 text-slate-900",
+      emerald: "bg-emerald-500 text-white",
+      rose: "bg-rose-500 text-white",
+      blue: "bg-blue-500 text-white"
+    };
+
     return (
-      <button onClick={onClick}
-        className={`flex flex-col items-center gap-1 p-2.5 px-3 rounded-3xl transition-all duration-300 ${
-          active ? activeColors[color] + " scale-105 shadow-xl" : "text-slate-500 hover:text-slate-300"
-        }`}>
-        <Icon name={icon} size={18} />
-        <span className="text-[7px] font-black uppercase tracking-tighter">{label}</span>
+      <button
+        onClick={onClick}
+        className={`flex flex-col items-center gap-1.5 px-4 py-3 rounded-3xl transition-all duration-200 active:scale-95 ${
+          active
+            ? activeColors[color] + " shadow-2xl scale-[1.03]"
+            : "text-slate-300/80 hover:text-white"
+        }`}
+      >
+        <Icon name={icon} size={22} />
+        <span className="text-[9px] font-black uppercase tracking-tight">{label}</span>
       </button>
     );
   };
