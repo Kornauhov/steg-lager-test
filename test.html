@@ -1,162 +1,201 @@
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Firebase Item Updater</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        .json-block {
-            font-family: 'Fira Code', 'Courier New', monospace;
-            tab-size: 2;
-        }
-        pre::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-        pre::-webkit-scrollbar-thumb {
-            background: #4b5563;
-            border-radius: 4px;
-        }
-    </style>
-</head>
-<body class="bg-slate-900 text-slate-100 min-h-screen p-4 md:p-8">
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, 
+  collection, 
+  getDocs, 
+  updateDoc, 
+  doc, 
+  signInWithCustomToken
+} from 'firebase/firestore';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { Loader2, Database, CheckCircle2, AlertCircle, RefreshCw } from 'lucide-react';
 
-    <div class="max-w-6xl mx-auto">
-        <!-- Header -->
-        <header class="mb-8 text-center">
-            <h1 class="text-3xl font-bold text-white mb-2">Artifacts DB Updater</h1>
-            <p class="text-slate-400">Füge die appID zu <code>/master_items</code> hinzu</p>
-        </header>
+// Firebase Konfiguration aus der Umgebung
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'stege-lager-v1';
 
-        <!-- Configuration Bar -->
-        <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 mb-8 shadow-xl">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 items-end">
-                <div>
-                    <label class="block text-sm font-medium text-slate-400 mb-2">Ziel App-ID</label>
-                    <input type="text" id="appIdInput" 
-                           value="1:655203951825:web:9edcfb40f29ed70f61d1f0" 
-                           class="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2 text-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-500">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-slate-400 mb-2">Datei auswählen</label>
-                    <input type="file" id="fileInput" accept=".json" 
-                           class="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor:pointer">
-                </div>
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [processing, setProcessing] = useState(false);
+  const [status, setStatus] = useState({ type: 'info', message: 'Bereit zur Aktualisierung' });
+  const [stats, setStats] = useState({ total: 0, updated: 0 });
+
+  // Pfad-Definition basierend auf deinen Vorgaben
+  const collectionPath = `artifacts/${appId}/public/data/master_items`;
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth Fehler:", error);
+        setStatus({ type: 'error', message: 'Authentifizierung fehlgeschlagen.' });
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const runUpdate = async () => {
+    if (!user) return;
+    
+    setProcessing(true);
+    setStatus({ type: 'info', message: 'Rufe Daten ab...' });
+    setStats({ total: 0, updated: 0 });
+
+    try {
+      // 1. Alle Dokumente aus der Collection holen
+      const itemsCol = collection(db, 'artifacts', appId, 'public', 'data', 'master_items');
+      const snapshot = await getDocs(itemsCol);
+      
+      const total = snapshot.size;
+      setStats(prev => ({ ...prev, total }));
+
+      if (total === 0) {
+        setStatus({ type: 'warning', message: 'Keine Dokumente im Pfad gefunden.' });
+        setProcessing(false);
+        return;
+      }
+
+      // 2. Jedes Dokument einzeln aktualisieren mit der gewünschten Struktur
+      let count = 0;
+      for (const itemDoc of snapshot.docs) {
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'master_items', itemDoc.id);
+        const currentData = itemDoc.data();
+
+        await updateDoc(docRef, {
+          appID: "stege-lager-v1",                      // (string)
+          awb: currentData.awb || "6001-001",           // (string)
+          lastUpdate: new Date().toISOString(),         // (ISO string timestamp)
+          length: Number(currentData.length) || 6000,   // (number)
+          steg1: currentData.steg1 || "284013",         // (string)
+          steg2: currentData.steg2 || "284037",         // (string)
+          steg3: currentData.steg3 || "",               // (string)
+          steg4: currentData.steg4 || ""                // (string)
+        });
+
+        count++;
+        setStats(prev => ({ ...prev, updated: count }));
+      }
+
+      setStatus({ 
+        type: 'success', 
+        message: `Erfolgreich abgeschlossen! ${count} Dokumente wurden in der DB aktualisiert.` 
+      });
+    } catch (error) {
+      console.error("Update Fehler:", error);
+      setStatus({ 
+        type: 'error', 
+        message: `Fehler beim Schreiben in die DB: ${error.message}` 
+      });
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white">
+        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-4 md:p-8 font-sans">
+      <div className="max-w-2xl mx-auto bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 overflow-hidden">
+        
+        {/* Header */}
+        <div className="p-8 bg-slate-800 border-b border-slate-700 text-center">
+            <div className="inline-flex p-3 bg-blue-500/10 rounded-full mb-4">
+                <Database className="w-8 h-8 text-blue-500" />
             </div>
+            <h1 className="text-2xl font-bold text-white">Cloud DB Updater</h1>
+            <p className="text-slate-400 mt-1">Pfad: <code className="text-blue-400">/{collectionPath}</code></p>
         </div>
 
-        <!-- Preview Section -->
-        <div id="previewArea" class="hidden space-y-6">
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <!-- Original -->
-                <div class="flex flex-col">
-                    <h3 class="text-lg font-semibold mb-3 flex items-center">
-                        <span class="w-3 h-3 bg-red-500 rounded-full mr-2"></span> Original (Erstes Item)
-                    </h3>
-                    <div class="bg-slate-950 rounded-xl p-4 border border-slate-800 flex-grow">
-                        <pre id="originalPre" class="json-block text-sm overflow-auto max-h-[400px] text-slate-300"></pre>
-                    </div>
-                </div>
-
-                <!-- Preview -->
-                <div class="flex flex-col">
-                    <h3 class="text-lg font-semibold mb-3 flex items-center">
-                        <span class="w-3 h-3 bg-green-500 rounded-full mr-2"></span> Aktualisiert (Vorschau)
-                    </h3>
-                    <div class="bg-slate-950 rounded-xl p-4 border border-slate-800 flex-grow">
-                        <pre id="updatedPre" class="json-block text-sm overflow-auto max-h-[400px] text-green-400"></pre>
-                    </div>
-                </div>
+        {/* Status Message */}
+        <div className="p-6">
+          <div className={`flex items-start p-4 rounded-xl border ${
+            status.type === 'error' ? 'bg-red-500/10 border-red-500/50 text-red-400' :
+            status.type === 'success' ? 'bg-green-500/10 border-green-500/50 text-green-400' :
+            status.type === 'warning' ? 'bg-yellow-500/10 border-yellow-500/50 text-yellow-400' :
+            'bg-blue-500/10 border-blue-500/50 text-blue-400'
+          }`}>
+            <div className="mr-3 mt-0.5">
+              {status.type === 'error' ? <AlertCircle className="w-5 h-5" /> :
+               status.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> :
+               <RefreshCw className={`w-5 h-5 ${processing ? 'animate-spin' : ''}`} />}
             </div>
-
-            <!-- Actions -->
-            <div class="flex flex-col items-center py-6 border-t border-slate-800">
-                <p id="itemCount" class="text-slate-400 mb-4 font-medium"></p>
-                <button id="downloadBtn" class="bg-green-600 hover:bg-green-500 text-white px-8 py-3 rounded-xl font-bold transition-all transform hover:scale-105 shadow-lg flex items-center">
-                    <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="Store-Lager-v1 herunterladen"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                    Aktualisierte JSON speichern
-                </button>
+            <div>
+              <p className="font-medium">{status.message}</p>
+              {stats.total > 0 && (
+                <p className="text-sm opacity-80 mt-1">
+                  Fortschritt: {stats.updated} / {stats.total} Dokumente
+                </p>
+              )}
             </div>
-        </div>
+          </div>
 
-        <!-- Empty State -->
-        <div id="emptyState" class="text-center py-20 bg-slate-800 rounded-xl border border-dashed border-slate-600">
-            <svg class="w-16 h-16 text-slate-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-            <p class="text-slate-400">Wähle eine JSON-Datei aus, um die Vorschau zu aktivieren</p>
+          {/* Progress Bar */}
+          {processing && (
+            <div className="mt-6 w-full bg-slate-700 rounded-full h-2 overflow-hidden">
+              <div 
+                className="bg-blue-500 h-full transition-all duration-300"
+                style={{ width: `${(stats.updated / stats.total) * 100}%` }}
+              ></div>
+            </div>
+          )}
+
+          {/* Action Button */}
+          <div className="mt-8">
+            <button
+              onClick={runUpdate}
+              disabled={processing || !user}
+              className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center transition-all ${
+                processing || !user
+                  ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
+                  : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/20 active:scale-[0.98]'
+              }`}
+            >
+              {processing ? (
+                <>
+                  <Loader2 className="w-5 h-5 mr-3 animate-spin" />
+                  Schreibe in DB...
+                </>
+              ) : (
+                'appID & Felder aktualisieren'
+              )}
+            </button>
+            <div className="mt-6 p-4 bg-slate-900/50 rounded-lg border border-slate-700">
+                <p className="text-xs text-slate-500 uppercase font-semibold mb-2 tracking-wider">Geplante Struktur pro Feld:</p>
+                <ul className="text-xs space-y-1 text-slate-400 font-mono">
+                    <li>appID: "stege-lager-v1" (string)</li>
+                    <li>awb: "6001-001" (string)</li>
+                    <li>lastUpdate: [ISO-Timestamp] (string)</li>
+                    <li>length: 6000 (number)</li>
+                    <li>steg1-4: [Werte] (string)</li>
+                </ul>
+            </div>
+          </div>
         </div>
+      </div>
     </div>
+  );
+};
 
-    <script>
-        const fileInput = document.getElementById('fileInput');
-        const appIdInput = document.getElementById('appIdInput');
-        const previewArea = document.getElementById('previewArea');
-        const emptyState = document.getElementById('emptyState');
-        const originalPre = document.getElementById('originalPre');
-        const updatedPre = document.getElementById('updatedPre');
-        const itemCount = document.getElementById('itemCount');
-        const downloadBtn = document.getElementById('downloadBtn');
-
-        let currentProcessedData = null;
-
-        fileInput.addEventListener('change', function(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = function(event) {
-                try {
-                    const data = JSON.parse(event.target.result);
-                    processData(data);
-                } catch (error) {
-                    alert('Fehler beim Lesen der JSON-Datei. Bitte prüfe das Format.');
-                }
-            };
-            reader.readAsText(file);
-        });
-
-        function processData(data) {
-            const targetAppId = appIdInput.value.trim();
-            const isArray = Array.isArray(data);
-            
-            // Preview Original
-            const originalSample = isArray ? data[0] : data;
-            originalPre.textContent = JSON.stringify(originalSample, null, 2);
-
-            // Process
-            if (isArray) {
-                currentProcessedData = data.map(item => ({
-                    ...item,
-                    appID: targetAppId
-                }));
-                itemCount.textContent = `${data.length} Items gefunden und verarbeitet.`;
-            } else {
-                currentProcessedData = { ...data, appID: targetAppId };
-                itemCount.textContent = `Einzelnes Objekt verarbeitet.`;
-            }
-
-            // Preview Updated
-            const updatedSample = isArray ? currentProcessedData[0] : currentProcessedData;
-            updatedPre.textContent = JSON.stringify(updatedSample, null, 2);
-
-            // Show UI
-            emptyState.classList.add('hidden');
-            previewArea.classList.remove('hidden');
-        }
-
-        downloadBtn.addEventListener('click', () => {
-            if (!currentProcessedData) return;
-            
-            const blob = new Blob([JSON.stringify(currentProcessedData, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = 'master_items_updated.json';
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            URL.revokeObjectURL(url);
-        });
-    </script>
-</body>
-</html>
+export default App;
