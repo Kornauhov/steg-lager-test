@@ -1,311 +1,110 @@
 <!DOCTYPE html>
-<html lang="de">
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Firestore AppID Patch</title>
+  <meta charset="UTF-8">
+  <title>Patch appId</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-50">
-  <div class="max-w-2xl mx-auto p-6">
-    <div class="bg-white rounded-3xl shadow-sm border border-slate-200 p-6">
-      <h1 class="text-xl font-black italic text-slate-900">Firestore: appId hinzufügen</h1>
-      <p class="text-sm text-slate-500 font-bold mt-1">
-        Diese Seite fügt <span class="font-black text-slate-800">NUR</span> das Feld <code class="bg-slate-100 px-2 py-1 rounded">appId</code> hinzu,
-        wenn es fehlt. (Public Zugang bleibt wie deine Rules es erlauben.)
-      </p>
+<body class="bg-slate-900 text-white p-8">
 
-      <div class="mt-6 grid gap-4">
-        <div class="bg-slate-900 text-yellow-500 rounded-2xl p-4">
-          <div class="text-xs font-black uppercase tracking-widest">Konfiguration</div>
-          <div class="mt-3 grid sm:grid-cols-2 gap-3">
-            <div>
-              <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">APP_ID</label>
-              <input id="appId" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-yellow-400 font-black outline-none"
-                     value="stege-lager-v1" />
-            </div>
-            <div>
-              <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">PROJECT_ID (nur Info)</label>
-              <input id="projectId" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 font-black outline-none"
-                     value="steg-lager-test" />
-            </div>
-          </div>
+<h1 class="text-2xl font-black mb-6">appId Patch Tool</h1>
 
-          <div class="mt-4 grid gap-2">
-            <label class="flex items-center gap-3 text-sm font-black text-slate-100">
-              <input id="doItems" type="checkbox" class="w-5 h-5" checked />
-              items patchen (slots/*/items via collectionGroup)
-            </label>
-            <label class="flex items-center gap-3 text-sm font-black text-slate-100">
-              <input id="doStock" type="checkbox" class="w-5 h-5" />
-              stock_entries patchen (optional)
-            </label>
-            <label class="flex items-center gap-3 text-sm font-black text-slate-100">
-              <input id="dryRun" type="checkbox" class="w-5 h-5" checked />
-              Dry-Run (nur zählen, nichts schreiben)
-            </label>
-            <div class="grid sm:grid-cols-2 gap-3 mt-2">
-              <div>
-                <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">Max Updates pro Lauf</label>
-                <input id="maxUpdates" type="number" min="1" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 font-black outline-none"
-                       value="500" />
-                <p class="text-[11px] text-slate-300 font-bold mt-1">
-                  (Firestore Batch-Limit: 500 Writes)
-                </p>
-              </div>
-              <div>
-                <label class="text-[10px] font-black uppercase tracking-widest text-slate-300">Scan Page Size</label>
-                <input id="pageSize" type="number" min="50" class="w-full mt-1 px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 font-black outline-none"
-                       value="500" />
-              </div>
-            </div>
-          </div>
-        </div>
+<button id="run" class="bg-emerald-600 px-6 py-3 rounded-xl font-black">
+  Start Patch
+</button>
 
-        <div class="flex flex-col sm:flex-row gap-3">
-          <button id="btnRun"
-                  class="flex-1 py-4 rounded-2xl bg-emerald-600 text-white font-black uppercase shadow-lg active:scale-[0.99] transition">
-            Start
-          </button>
-          <button id="btnStop"
-                  class="sm:w-48 py-4 rounded-2xl bg-slate-200 text-slate-700 font-black uppercase active:scale-[0.99] transition">
-            Stop
-          </button>
-        </div>
+<pre id="log" class="mt-6 bg-black p-4 rounded-xl text-sm overflow-auto max-h-[500px]"></pre>
 
-        <div class="bg-white rounded-3xl border border-slate-200 p-5">
-          <div class="flex items-center justify-between">
-            <div class="text-xs font-black uppercase tracking-widest text-slate-500">Status</div>
-            <div id="badge" class="text-[10px] font-black uppercase px-3 py-1 rounded-full bg-slate-100 text-slate-700">bereit</div>
-          </div>
-          <div class="mt-3 text-sm font-bold text-slate-700">
-            <div>Gescannte Docs: <span id="scanned" class="font-black">0</span></div>
-            <div>Fehlende appId: <span id="missing" class="font-black">0</span></div>
-            <div>Geschrieben: <span id="written" class="font-black">0</span></div>
-          </div>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
+import {
+  getFirestore,
+  collection,
+  getDocs,
+  writeBatch
+} from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
 
-          <pre id="log" class="mt-4 bg-slate-900 text-slate-100 rounded-2xl p-4 text-[12px] overflow-auto max-h-72 whitespace-pre-wrap"></pre>
-        </div>
+const firebaseConfig = {
+  apiKey: "AIzaSyBGqPXXcmJTbL3PVrn-PKL0Gig45r6GPbQ",
+  authDomain: "steg-lager-test.firebaseapp.com",
+  projectId: "steg-lager-test",
+  storageBucket: "steg-lager-test.firebasestorage.app",
+  messagingSenderId: "655203951825",
+  appId: "1:655203951825:web:9edcfb40f29ed70f61d1f0"
+};
 
-        <div class="text-[12px] text-slate-500 font-bold">
-          Hinweis: Für <b>collectionGroup("items")</b> brauchst du ggf. einen Index, je nach Query.
-          Wir scannen hier ohne where-filter und filtern dann per Pfad-Prefix:
-          <code class="bg-slate-100 px-2 py-1 rounded">artifacts/&lt;APP_ID&gt;/public/data/slots/</code>
-        </div>
-      </div>
-    </div>
-  </div>
+const APP_ID = "stege-lager-v1";
 
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
-    import {
-      getFirestore,
-      collection,
-      collectionGroup,
-      doc,
-      query,
-      orderBy,
-      startAfter,
-      limit,
-      getDocs,
-      writeBatch,
-      FieldPath
-    } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
-    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
 
-    // === Deine Firebase Config (wie in deiner App) ===
-    const firebaseConfig = {
-      apiKey: "AIzaSyBGqPXXcmJTbL3PVrn-PKL0Gig45r6GPbQ",
-      authDomain: "steg-lager-test.firebaseapp.com",
-      databaseURL: "https://steg-lager-test-default-rtdb.europe-west1.firebasedatabase.app",
-      projectId: "steg-lager-test",
-      storageBucket: "steg-lager-test.firebasestorage.app",
-      messagingSenderId: "655203951825",
-      appId: "1:655203951825:web:9edcfb40f29ed70f61d1f0",
-      measurementId: "G-Q6FX41P556"
-    };
+const log = (msg) => {
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+};
 
-    const app = initializeApp(firebaseConfig);
-    const db = getFirestore(app);
-    const auth = getAuth(app);
+async function patchCollectionRecursive(colRef) {
+  const snap = await getDocs(colRef);
 
-    // UI helpers
-    const $ = (id) => document.getElementById(id);
-    const logEl = $("log");
+  let batch = writeBatch(db);
+  let batchCount = 0;
+  let updated = 0;
 
-    const setBadge = (text, kind = "ready") => {
-      const b = $("badge");
-      b.textContent = text;
-      b.className = "text-[10px] font-black uppercase px-3 py-1 rounded-full " + (
-        kind === "run" ? "bg-emerald-100 text-emerald-700" :
-        kind === "stop" ? "bg-rose-100 text-rose-700" :
-        kind === "warn" ? "bg-yellow-100 text-yellow-700" :
-        "bg-slate-100 text-slate-700"
-      );
-    };
+  for (const docSnap of snap.docs) {
+    const data = docSnap.data() || {};
+    const docRef = docSnap.ref;
 
-    const appendLog = (line) => {
-      logEl.textContent += (logEl.textContent ? "\n" : "") + line;
-      logEl.scrollTop = logEl.scrollHeight;
-    };
+    if (!data.appId) {
+      batch.update(docRef, { appId: APP_ID });
+      batchCount++;
+      updated++;
 
-    let shouldStop = false;
-
-    $("btnStop").addEventListener("click", () => {
-      shouldStop = true;
-      setBadge("stop…", "stop");
-      appendLog("STOP angefordert…");
-    });
-
-    $("btnRun").addEventListener("click", async () => {
-      shouldStop = false;
-      logEl.textContent = "";
-      $("scanned").textContent = "0";
-      $("missing").textContent = "0";
-      $("written").textContent = "0";
-
-      setBadge("auth…", "run");
-      appendLog("Anon Auth…");
-
-      try {
-        await signInAnonymously(auth);
-      } catch (e) {
-        setBadge("auth error", "stop");
-        appendLog("AUTH ERROR: " + (e?.message || e));
-        return;
+      if (batchCount >= 500) {
+        await batch.commit();
+        log("Batch commit 500");
+        batch = writeBatch(db);
+        batchCount = 0;
       }
+    }
 
-      const APP_ID = $("appId").value.trim();
-      const doItems = $("doItems").checked;
-      const doStock = $("doStock").checked;
-      const dryRun = $("dryRun").checked;
-      const maxUpdates = Math.max(1, Number($("maxUpdates").value) || 500);
-      const pageSize = Math.max(50, Number($("pageSize").value) || 500);
+    // rekursiv Subcollections
+    const subcols = await docRef.listCollections();
+    for (const sub of subcols) {
+      updated += await patchCollectionRecursive(sub);
+    }
+  }
 
-      const PATH_PREFIX = `artifacts/${APP_ID}/public/data/slots/`;
+  if (batchCount > 0) {
+    await batch.commit();
+    log("Batch commit final " + batchCount);
+  }
 
-      appendLog(`APP_ID = ${APP_ID}`);
-      appendLog(`PATH_PREFIX = ${PATH_PREFIX}`);
-      appendLog(`DryRun = ${dryRun}`);
-      appendLog(`MaxUpdates = ${maxUpdates}`);
-      appendLog(`PageSize = ${pageSize}`);
-      appendLog(`Targets: items=${doItems}, stock_entries=${doStock}`);
+  return updated;
+}
 
-      setBadge("laufend", "run");
+document.getElementById("run").onclick = async () => {
+  log("Authenticating...");
+  await signInAnonymously(auth);
 
-      let scanned = 0;
-      let missing = 0;
-      let written = 0;
+  log("Start patching...");
 
-      const bump = () => {
-        $("scanned").textContent = String(scanned);
-        $("missing").textContent = String(missing);
-        $("written").textContent = String(written);
-      };
+  const rootCollection = collection(
+    db,
+    "artifacts",
+    APP_ID,
+    "public",
+    "data"
+  );
 
-      // Helper: batch update up to 500 refs
-      const batchUpdate = async (refs, patch) => {
-        if (dryRun) return 0;
-        const b = writeBatch(db);
-        for (const r of refs) b.update(r, patch);
-        await b.commit();
-        return refs.length;
-      };
+  let totalUpdated = await patchCollectionRecursive(rootCollection);
 
-      // 1) items via collectionGroup("items") – scan in pages
-      if (doItems) {
-        appendLog("\n[items] Scan collectionGroup('items')…");
-        let lastDoc = null;
+  log("DONE ✅");
+  log("Updated documents: " + totalUpdated);
+};
+</script>
 
-        // We orderBy documentId to paginate reliably
-        while (!shouldStop) {
-          const q = lastDoc
-            ? query(collectionGroup(db, "items"), orderBy(FieldPath.documentId()), startAfter(lastDoc), limit(pageSize))
-            : query(collectionGroup(db, "items"), orderBy(FieldPath.documentId()), limit(pageSize));
-
-          const snap = await getDocs(q);
-          if (snap.empty) break;
-
-          // collect missing appId docs in our path
-          const toWriteRefs = [];
-          snap.forEach((d) => {
-            scanned++;
-            const data = d.data() || {};
-            const hasAppId = typeof data.appId === "string" && data.appId.length > 0;
-            const inOurPath = d.ref.path.includes(PATH_PREFIX);
-            if (inOurPath && !hasAppId) {
-              missing++;
-              if (toWriteRefs.length < Math.min(500, maxUpdates - written)) {
-                toWriteRefs.push(d.ref);
-              }
-            }
-          });
-
-          bump();
-
-          if (toWriteRefs.length > 0) {
-            const n = await batchUpdate(toWriteRefs, { appId: APP_ID });
-            written += n;
-            bump();
-            appendLog(`[items] batch commit: ${n} updates`);
-          }
-
-          // stop if reached maxUpdates
-          if (!dryRun && written >= maxUpdates) {
-            appendLog(`[items] MaxUpdates erreicht (${maxUpdates}).`);
-            break;
-          }
-
-          lastDoc = snap.docs[snap.docs.length - 1];
-          if (snap.size < pageSize) break;
-        }
-
-        appendLog(`[items] done. scanned=${scanned}, missing=${missing}, written=${written}`);
-      }
-
-      // 2) stock_entries (optional)
-      if (doStock && !shouldStop) {
-        appendLog("\n[stock_entries] Scan artifacts/APP_ID/public/data/stock_entries …");
-        // stock_entries is a single collection; we scan in one go (usually not huge)
-        const stockCol = collection(db, "artifacts", APP_ID, "public", "data", "stock_entries");
-        const snap = await getDocs(stockCol);
-
-        const toWriteRefs = [];
-        snap.forEach((d) => {
-          scanned++;
-          const data = d.data() || {};
-          const hasAppId = typeof data.appId === "string" && data.appId.length > 0;
-          if (!hasAppId) {
-            missing++;
-            if (toWriteRefs.length < Math.min(500, maxUpdates - written)) {
-              toWriteRefs.push(d.ref);
-            }
-          }
-        });
-
-        bump();
-
-        if (toWriteRefs.length > 0) {
-          const n = await batchUpdate(toWriteRefs, { appId: APP_ID });
-          written += n;
-          bump();
-          appendLog(`[stock_entries] commit: ${n} updates`);
-        }
-
-        appendLog(`[stock_entries] done.`);
-      }
-
-      if (shouldStop) {
-        setBadge("gestoppt", "stop");
-        appendLog("\nSTOP: Vorgang abgebrochen.");
-      } else if (dryRun) {
-        setBadge("dry-run fertig", "warn");
-        appendLog("\nDRY-RUN fertig (nichts geschrieben).");
-      } else {
-        setBadge("fertig", "ready");
-        appendLog("\nFERTIG ✅");
-      }
-    });
-  </script>
 </body>
 </html>
