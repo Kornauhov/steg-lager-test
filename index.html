@@ -29,23 +29,38 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
   import {
-    getFirestore, collection, collectionGroup, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc, query
+    getFirestore,
+    collection,
+    doc,
+    setDoc,
+    onSnapshot,
+    deleteDoc,
+    updateDoc,
+    getDoc
   } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
   import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
 
   window.FirebaseSDK = {
-    initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc, query,
-    getAuth, signInAnonymously, onAuthStateChanged
+    initializeApp,
+    getFirestore,
+    collection,
+    doc,
+    setDoc,
+    onSnapshot,
+    deleteDoc,
+    updateDoc,
+    getDoc,
+    getAuth,
+    signInAnonymously,
+    onAuthStateChanged
   };
 </script>
 
 <script type="text/babel">
-  const { useState, useEffect, useMemo } = React;
+  const { useState, useEffect, useMemo, useRef } = React;
   const {
-    initializeApp, getFirestore, collection, collectionGroup, doc, setDoc,
-    onSnapshot, deleteDoc, updateDoc, getDoc, query,
+    initializeApp, getFirestore, collection, doc, setDoc,
+    onSnapshot, deleteDoc, updateDoc, getDoc,
     getAuth, signInAnonymously, onAuthStateChanged
   } = window.FirebaseSDK;
 
@@ -73,9 +88,8 @@
   const safeDocId = (s) => String(s || "").replace(/\//g, "_").trim();
   const slotIdFrom = (shelf, level) => `${String(shelf)}_L${Number(level)}`;
 
-  // ✅ derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
+  // derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
   const deriveFromPath = (path) => {
-    // Example: "artifacts/stege-lager-v1/public/data/slots/C1_L1/items/STEG_A"
     const parts = String(path).split("/");
     const idx = parts.indexOf("slots");
     if (idx === -1) return { slotId: null, shelf: null, level: null };
@@ -92,7 +106,7 @@
     const [loading, setLoading] = useState(true);
     const [user, setUser] = useState(null);
 
-    // raw docs from firestore (no filter)
+    // raw docs from firestore (scoped listeners: only this APP_ID)
     const [rawItems, setRawItems] = useState([]);
     const [stegItems, setStegItems] = useState([]);
     const [masterItems, setMasterItems] = useState([]);
@@ -107,6 +121,10 @@
     const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
     const levels = [5, 4, 3, 2, 1];
 
+    // holds item unsubscribers per slotId
+    const itemUnsubsRef = useRef(new Map());
+    const unsubSlotsRef = useRef(null);
+
     useEffect(() => {
       const init = async () => {
         try { await signInAnonymously(auth); }
@@ -120,27 +138,81 @@
       return () => unsub();
     }, []);
 
+    // ✅ optimization: create lucide icons once
     useEffect(() => {
       if (window.lucide) window.lucide.createIcons();
-    }, [activeTab, rawItems.length, stegItems.length]);
+    }, []);
+
+    // create icons when content changes (optional, keeps icons always correct)
+    useEffect(() => {
+      if (window.lucide) window.lucide.createIcons();
+    }, [activeTab, rawItems.length]);
 
     useEffect(() => {
       if (!user) return;
 
-      // ✅ NO where(appId==...) here (to avoid "empty" due to filter/index)
-      const itemsQ = query(collectionGroup(db, "items"));
-      const unsubItems = onSnapshot(
-        itemsQ,
-        (snap) => {
-          const docs = snap.docs.map(d => ({
-            __path: d.ref.path,
-            __id: d.id,
-            ...d.data()
-          }));
-          console.log("RAW items snap:", snap.size, docs.slice(0,3));
-          setRawItems(docs);
+      // ✅ PROBLEM 2 FIX:
+      // Scoped listeners only under: artifacts/{APP_ID}/public/data/slots/{slotId}/items/{itemId}
+      // No collectionGroup("items") anymore.
+      const slotsRef = collection(db, "artifacts", APP_ID, "public", "data", "slots");
+
+      // cleanup any previous listeners (if hot reload etc.)
+      if (unsubSlotsRef.current) {
+        try { unsubSlotsRef.current(); } catch {}
+        unsubSlotsRef.current = null;
+      }
+      for (const unsub of itemUnsubsRef.current.values()) {
+        try { unsub(); } catch {}
+      }
+      itemUnsubsRef.current.clear();
+      setRawItems([]); // reset to avoid stale data
+
+      unsubSlotsRef.current = onSnapshot(
+        slotsRef,
+        (slotsSnap) => {
+          const slotIds = slotsSnap.docs.map(d => d.id);
+
+          // remove listeners for slots that disappeared
+          for (const [slotId, unsub] of itemUnsubsRef.current.entries()) {
+            if (!slotIds.includes(slotId)) {
+              try { unsub(); } catch {}
+              itemUnsubsRef.current.delete(slotId);
+              // also remove items belonging to that slot from state
+              setRawItems(prev => prev.filter(x => x.__slotId !== slotId));
+            }
+          }
+
+          // add listeners for new slots
+          for (const slotId of slotIds) {
+            if (itemUnsubsRef.current.has(slotId)) continue;
+
+            const itemsRef = collection(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items");
+
+            const unsubItems = onSnapshot(
+              itemsRef,
+              (itemsSnap) => {
+                setRawItems(prev => {
+                  // remove old items of this slot
+                  const cleaned = prev.filter(x => x.__slotId !== slotId);
+
+                  // add latest
+                  const next = itemsSnap.docs.map(d => ({
+                    __path: d.ref.path,
+                    __id: d.id,
+                    __slotId: slotId,
+                    ...d.data()
+                  }));
+
+                  return [...cleaned, ...next];
+                });
+              },
+              (err) => console.error("Items fetch error (slot):", slotId, err)
+            );
+
+            itemUnsubsRef.current.set(slotId, unsubItems);
+          }
         },
-        (err) => console.error("Items fetch error:", err)
+        (err) => console.error("Slots fetch error:", err)
       );
 
       const unsubSteg = onSnapshot(
@@ -161,21 +233,29 @@
         (err) => console.error("Master items fetch error:", err)
       );
 
-      return () => { unsubItems(); unsubSteg(); unsubMaster(); };
+      return () => {
+        // slots listener
+        if (unsubSlotsRef.current) {
+          try { unsubSlotsRef.current(); } catch {}
+          unsubSlotsRef.current = null;
+        }
+        // items listeners
+        for (const unsub of itemUnsubsRef.current.values()) {
+          try { unsub(); } catch {}
+        }
+        itemUnsubsRef.current.clear();
+
+        unsubSteg();
+        unsubMaster();
+      };
     }, [user]);
 
-    // ✅ Filter client-side by appId OR by path containing "/artifacts/stege-lager-v1/"
+    // items normalized
     const itemDocs = useMemo(() => {
       const out = [];
 
       for (const d of rawItems) {
         const path = d.__path || "";
-        const pathHasApp = path.includes(`artifacts/${APP_ID}/`);
-        const fieldHasApp = String(d.appId || "") === APP_ID;
-
-        // accept if either matches (robust during migration)
-        if (!pathHasApp && !fieldHasApp) continue;
-
         const derived = deriveFromPath(path);
 
         const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
@@ -204,7 +284,7 @@
       return out;
     }, [rawItems]);
 
-    // ✅ slotMap for dashboard/inventory
+    // slotMap for dashboard/inventory
     const slotMap = useMemo(() => {
       const m = new Map();
       for (const it of itemDocs) {
@@ -274,7 +354,7 @@
       }).filter(Boolean);
     }, [groupedSlots, searchQuery, awbIndex]);
 
-    // Firestore refs for writes (new model)
+    // Firestore refs for writes
     const slotDocRef = (slotId) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId);
     const itemDocRef = (slotId, itemKey) => doc(db, "artifacts", APP_ID, "public", "data", "slots", slotId, "items", safeDocId(itemKey));
 
